@@ -2,6 +2,7 @@
 import type { NextApiRequest, NextApiResponse } from "next";
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
+const TMDB_API_KEY = process.env.TMDB_API_KEY;
 
 // Lo que tú mandas desde la app
 type IncomingRating = {
@@ -12,7 +13,7 @@ type IncomingRating = {
   actuacion: number;
   bso: number;
   disfrute: number;
-  title?: string; // ahora sí esperamos título
+  title?: string; // lo rellenaremos desde TMDB si no viene
   year?: string;
 };
 
@@ -27,21 +28,52 @@ type ApiResponse =
   | { error: string; info?: string }
   | { recommendations: AiRecommendation[]; info?: string };
 
-// 🔧 Función para normalizar títulos: minúsculas, sin año entre paréntesis, sin dobles espacios
+// 🔧 Normalizar títulos: minúsculas, sin año entre paréntesis, sin signos típicos
 function normalizeTitle(raw: string | undefined | null): string {
   if (!raw) return "";
   let t = raw.toLowerCase().trim();
 
-  // Quitar " (1994)" o cosas entre paréntesis al final
+  // Quitar " (1994)" o cualquier paréntesis al final
   t = t.replace(/\s*\([^)]*\)\s*$/g, "");
 
   // Quitar espacios duplicados
   t = t.replace(/\s+/g, " ");
 
-  // Quitar algunos signos de puntuación típicos que cambian poco el sentido
+  // Quitar algunos signos de puntuación simples
   t = t.replace(/[:\-–_]/g, "").trim();
 
   return t;
+}
+
+// 🔧 Obtener título y año desde TMDB según tmdbId
+async function fetchTitleYearFromTmdb(
+  tmdbId: number
+): Promise<{ title?: string; year?: string }> {
+  try {
+    if (!TMDB_API_KEY) return {};
+
+    const resp = await fetch(
+      `https://api.themoviedb.org/3/movie/${tmdbId}?api_key=${TMDB_API_KEY}&language=es-ES`
+    );
+
+    if (!resp.ok) {
+      console.error("TMDB error status para", tmdbId, resp.status);
+      return {};
+    }
+
+    const data: any = await resp.json();
+    const title: string | undefined = data?.title;
+    const releaseDate: string | undefined = data?.release_date;
+    const year =
+      releaseDate && releaseDate.length >= 4
+        ? releaseDate.substring(0, 4)
+        : undefined;
+
+    return { title, year };
+  } catch (e) {
+    console.error("Error llamando a TMDB para", tmdbId, e);
+    return {};
+  }
 }
 
 export default async function handler(
@@ -54,19 +86,19 @@ export default async function handler(
       return res.status(405).json({ error: "Método no permitido" });
     }
 
-    const { uid, ratings, maxItems } = req.body as {
+    const { uid, ratings: rawRatings, maxItems } = req.body as {
       uid?: string;
       ratings?: IncomingRating[];
       maxItems?: number;
     };
 
-    if (!uid || !Array.isArray(ratings)) {
+    if (!uid || !Array.isArray(rawRatings)) {
       return res
         .status(400)
         .json({ error: "uid y ratings (array) son obligatorios" });
     }
 
-    if (ratings.length === 0) {
+    if (rawRatings.length === 0) {
       return res.status(200).json({
         recommendations: [],
         info: "Usuario sin valoraciones aún.",
@@ -75,6 +107,22 @@ export default async function handler(
 
     const max = typeof maxItems === "number" && maxItems > 0 ? maxItems : 15;
 
+    // 0) Enriquecemos los ratings con título/año desde TMDB si hace falta
+    const ratings: IncomingRating[] = await Promise.all(
+      rawRatings.map(async (r) => {
+        // Si ya viene título, lo respetamos
+        if (r.title || !TMDB_API_KEY) return r;
+
+        const extra = await fetchTitleYearFromTmdb(r.tmdbId);
+
+        return {
+          ...r,
+          title: r.title ?? extra.title,
+          year: r.year ?? extra.year,
+        };
+      })
+    );
+
     // 🔹 Conjunto de títulos YA vistos normalizados
     const ratedTitlesSet = new Set(
       ratings
@@ -82,14 +130,14 @@ export default async function handler(
         .filter((t) => t.length > 0)
     );
 
-    // 🔹 Conjunto de tmdbIds YA vistos (por si Gemini nos los devuelve)
+    // 🔹 Conjunto de tmdbIds YA vistos
     const ratedIdsSet = new Set(
       ratings
         .map((r) => r.tmdbId)
         .filter((id) => typeof id === "number" && id > 0)
     );
 
-    // 1) Fallback local: ordenar por nota global (esto sí puede repetir vistas)
+    // 1) Fallback local: ordenar por nota global (esto puede repetir vistas, es solo por si IA falla)
     const sortedByOverall = [...ratings].sort(
       (a, b) => b.overall - a.overall
     );
@@ -102,9 +150,15 @@ export default async function handler(
         reason: `Te la recomiendo porque la valoraste con un ${r.overall}/10 (guion ${r.guion}/10, disfrute ${r.disfrute}/10).`,
       }));
 
-    
+    // Si NO hay API key de Gemini, devolvemos solo fallback
+    if (!GEMINI_API_KEY) {
+      return res.status(200).json({
+        recommendations: localFallback,
+        info: "Devueltas solo recomendaciones locales (sin IA, falta GEMINI_API_KEY).",
+      });
+    }
 
-    // 2) Preparamos prompt para Gemini
+    // 2) Preparamos prompt para Gemini con ratings enriquecidos
     const subsetForPrompt = ratings.slice(0, 80);
 
     const userMoviesForPrompt = subsetForPrompt
