@@ -1,114 +1,197 @@
-// api/recommend.js
+// /api/recommendations/route.ts  (Vercel Edge/Node)
+import type { NextRequest } from "next/server";
 
-const MAX_RATINGS_FOR_PROMPT = 80; // si el usuario tiene más, recortamos
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 
-export default async function handler(req, res) {
-  if (req.method !== "POST") {
-    return res.status(405).json({ error: "Use POST" });
-  }
+// Tipos que vienen desde tu app
+type IncomingRating = {
+  tmdbId: number;
+  title: string;
+  year?: string;
+  overall: number;
+  guion: number;
+  direccion: number;
+  actuacion: number;
+  bso: number;
+  disfrute: number;
+};
 
-  const { uid, ratings, userPrompt, mode } = req.body || {};
+type AiRecommendation = {
+  tmdbId?: number;
+  title: string;
+  reason: string;
+};
 
-  if (!uid || !Array.isArray(ratings)) {
-    return res.status(400).json({
-      error: "uid y ratings (array) son obligatorios"
-    });
-  }
-
-  // Si tiene pocas, usamos TODAS. Si tiene muchísimas, recortamos para el prompt.
-  let usedRatings = ratings;
-  const totalRatings = ratings.length;
-
-  if (totalRatings > MAX_RATINGS_FOR_PROMPT) {
-    // me quedo con las últimas N (asumiendo que tú las mandas ordenadas por fecha)
-    usedRatings = ratings.slice(-MAX_RATINGS_FOR_PROMPT);
-  }
-
-  const effectiveMode = mode === "prompt" ? "prompt" : "auto";
-
-  const basePrompt = `
-Eres un recomendador de cine para un grupo privado llamado "Cine Mensa Murcia".
-
-Tienes las valoraciones de este usuario (hasta un máximo de ${MAX_RATINGS_FOR_PROMPT}, pero en total tiene ${totalRatings}):
-
-${JSON.stringify(usedRatings, null, 2)}
-
-Cada elemento incluye como mínimo:
-- tmdbId
-- title
-- overall
-- (y opcionalmente guion, direccion, actuacion, bso, disfrute)
-
-Tu tarea:
-- Generar una lista de 3 a 8 recomendaciones de películas.
-- Devuelve SOLO un JSON válido con este formato:
-
-[
-  {
-    "tmdbId": 123,
-    "title": "Título en español",
-    "reason": "Explicación clara, breve y cercana de por qué se la recomiendo."
-  }
-]
-
-Reglas:
-- No incluyas texto extra fuera del JSON.
-- No repitas películas que ya aparecen en las valoraciones de entrada (usa sus tmdbId para evitar duplicados).
-- Si mode = "auto", usa SOLO su historial de gustos.
-- Si mode = "prompt", además ten MUY en cuenta esta petición específica del usuario:
-  "${userPrompt || ""}"
-- Evita recomendar pelis extremadamente difíciles o experimentales a menos que su historial lo sugiera.
-`;
-
+export async function POST(req: NextRequest) {
   try {
-    const geminiKey = process.env.GEMINI_API_KEY;
-    if (!geminiKey) {
-      return res.status(500).json({
-        error: "Falta GEMINI_API_KEY en el servidor"
-      });
+    const body = await req.json();
+
+    const uid = body.uid as string | undefined;
+    const ratings = body.ratings as IncomingRating[] | undefined;
+    const maxItems = (body.maxItems as number | undefined) ?? 15;
+
+    if (!uid || !ratings || !Array.isArray(ratings)) {
+      return new Response(
+        JSON.stringify({ error: "uid y ratings (array) son obligatorios" }),
+        { status: 400, headers: { "Content-Type": "application/json" } }
+      );
     }
 
-    const response = await fetch(
-      "https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=" +
-        geminiKey,
+    if (ratings.length === 0) {
+      return new Response(
+        JSON.stringify({
+          recommendations: [],
+          info: "Usuario sin valoraciones aún.",
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } }
+      );
+    }
+
+    // 1) FALBACK LOCAL: top N pelis según tu propia media
+    const sortedByOverall = [...ratings].sort(
+      (a, b) => b.overall - a.overall
+    );
+    const localFallback: AiRecommendation[] = sortedByOverall
+      .slice(0, Math.min(maxItems, sortedByOverall.length))
+      .map((r) => ({
+        tmdbId: r.tmdbId,
+        title: r.title,
+        reason: `Te la recomiendo porque la valoraste con un ${r.overall}/10 y encaja mucho con tu estilo.`,
+      }));
+
+    // Si no hay API key de Gemini, devolvemos directamente el fallback local
+    if (!GEMINI_API_KEY) {
+      return new Response(
+        JSON.stringify({
+          recommendations: localFallback,
+          info: "Devueltas sólo recomendaciones locales (sin IA).",
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } }
+      );
+    }
+
+    // 2) Llamada a Gemini para intentar enriquecer/mejorar las recomendaciones
+    const userMoviesForPrompt = ratings
+      .slice(0, 80) // límite para no pasarnos
+      .map(
+        (r) =>
+          `- ${r.title} (${r.year ?? "?"}): general ${r.overall}/10, guion ${r.guion}/10, dirección ${r.direccion}/10, actuación ${r.actuacion}/10, BSO ${r.bso}/10, disfrute ${r.disfrute}/10`
+      )
+      .join("\n");
+
+    const systemPrompt = `
+Eres un recomendador de cine para un grupo de amigos. 
+Tienes que recomendar películas basándote en las valoraciones del usuario.
+
+Responde SIEMPRE en JSON *puro* con este formato EXACTO:
+
+{
+  "recommendations": [
+    { "tmdbId": 13, "title": "Forrest Gump", "reason": "..." },
+    { "tmdbId": 272, "title": "El padrino", "reason": "..." }
+  ]
+}
+
+- "tmdbId" puede ser 0 si no lo conoces, pero intenta usar uno real si lo sabes.
+- "title" es obligatorio.
+- "reason" debe explicar por qué se la recomiendas, usando sus gustos.
+`;
+
+    const userPrompt = `
+Usuario con uid=${uid}
+
+Estas son algunas de sus valoraciones (máximo 80):
+
+${userMoviesForPrompt}
+
+Devuélveme hasta ${maxItems} recomendaciones variadas, con "tmdbId" si lo conoces, "title" y "reason" clara y breve.
+`;
+
+    const geminiResponse = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${GEMINI_API_KEY}`,
       {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           contents: [
-            {
-              parts: [{ text: basePrompt }]
-            }
-          ]
-        })
+            { role: "user", parts: [{ text: systemPrompt }] },
+            { role: "user", parts: [{ text: userPrompt }] },
+          ],
+        }),
       }
     );
 
-    const aiJson = await response.json();
-
-    const text =
-      aiJson?.candidates?.[0]?.content?.parts?.[0]?.text?.trim() || "[]";
-
-    let recommendations = [];
-    try {
-      recommendations = JSON.parse(text);
-      if (!Array.isArray(recommendations)) {
-        recommendations = [];
-      }
-    } catch (e) {
-      console.error("Error parseando JSON de Gemini:", e, text);
-      recommendations = [];
+    if (!geminiResponse.ok) {
+      console.error("Gemini error status:", geminiResponse.status);
+      const text = await geminiResponse.text();
+      console.error("Gemini error body:", text);
+      // Devolvemos fallback
+      return new Response(
+        JSON.stringify({
+          recommendations: localFallback,
+          info: "Se ha usado fallback local por error al llamar a Gemini.",
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } }
+      );
     }
 
-    return res.status(200).json({
-      recommendations,
-      usedRatingsCount: usedRatings.length,
-      totalRatings
-    });
-  } catch (e) {
-    console.error(e);
-    return res.status(500).json({
-      error: "Error interno en la recomendación"
-    });
+    const geminiJson = await geminiResponse.json();
+    const candidates = geminiJson.candidates ?? [];
+    if (!candidates.length) {
+      console.warn("Gemini sin candidates. Usando fallback local.");
+      return new Response(
+        JSON.stringify({
+          recommendations: localFallback,
+          info: "Gemini no devolvió candidatos, usando fallback local.",
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } }
+      );
+    }
+
+    const textPart =
+      candidates[0]?.content?.parts?.[0]?.text ??
+      JSON.stringify({ recommendations: [] });
+
+    let parsed: { recommendations?: AiRecommendation[] } = {};
+    try {
+      parsed = JSON.parse(textPart);
+    } catch (e) {
+      console.error("Error al parsear JSON de Gemini:", e, textPart);
+      // texto venía con cosas extra; intentamos recortar
+      const match = textPart.match(/\{[\s\S]*\}/);
+      if (match) {
+        try {
+          parsed = JSON.parse(match[0]);
+        } catch (e2) {
+          console.error("Parseo 2 fallido:", e2);
+        }
+      }
+    }
+
+    let finalRecs = Array.isArray(parsed.recommendations)
+      ? parsed.recommendations
+      : [];
+
+    // Filtrado básico: al menos título
+    finalRecs = finalRecs.filter((r) => r && r.title && r.title.trim().length > 0);
+
+    // Si tras todo esto no hay ninguna, usamos fallback local
+    if (!finalRecs.length) {
+      finalRecs = localFallback;
+    }
+
+    return new Response(
+      JSON.stringify({
+        recommendations: finalRecs.slice(0, maxItems),
+        info: "Recomendaciones generadas con IA (con fallback local si hacía falta).",
+      }),
+      { status: 200, headers: { "Content-Type": "application/json" } }
+    );
+  } catch (e: any) {
+    console.error("Error general en /api/recommendations:", e);
+    return new Response(
+      JSON.stringify({ error: "Error interno en el servidor." }),
+      { status: 500, headers: { "Content-Type": "application/json" } }
+    );
   }
 }
