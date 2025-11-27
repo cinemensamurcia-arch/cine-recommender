@@ -12,8 +12,8 @@ type IncomingRating = {
   actuacion: number;
   bso: number;
   disfrute: number;
-  title?: string; // opcional
-  year?: string;  // opcional
+  title?: string; // ahora SÍ esperamos que lleguen
+  year?: string;
 };
 
 // Lo que devolverá el endpoint a tu app
@@ -58,6 +58,13 @@ export default async function handler(
 
     const max = typeof maxItems === "number" && maxItems > 0 ? maxItems : 15;
 
+    // 🔹 Conjunto de títulos ya vistos (para evitar recomendar lo mismo cuando usemos IA)
+    const ratedTitlesSet = new Set(
+      ratings
+        .map((r) => (r.title ?? "").toLowerCase().trim())
+        .filter((t) => t.length > 0)
+    );
+
     // 1) Fallback local: ordenar por nota global y usar eso si la IA falla
     const sortedByOverall = [...ratings].sort(
       (a, b) => b.overall - a.overall
@@ -68,7 +75,7 @@ export default async function handler(
       .map((r) => ({
         tmdbId: r.tmdbId,
         title: r.title ?? `Película ${r.tmdbId}`,
-        reason: `Te la recomiendo porque la valoraste con un ${r.overall}/10.`,
+        reason: `Te la recomiendo porque la valoraste con un ${r.overall}/10 (guion ${r.guion}/10, disfrute ${r.disfrute}/10).`,
       }));
 
     // Si NO hay API key, devolvemos únicamente el fallback local (pero sin error 500)
@@ -91,11 +98,29 @@ export default async function handler(
       })
       .join("\n");
 
+    const seenTitlesList = subsetForPrompt
+      .map((r) => r.title)
+      .filter((t): t is string => !!t && t.trim().length > 0)
+      .join(", ");
+
+    // 🧠 System prompt: rol del modelo + formato JSON estricto
     const systemPrompt = `
 Eres un recomendador de cine para un grupo de amigos.
-Tienes que recomendar películas basándote en las valoraciones del usuario.
+Tu objetivo es recomendar películas NUEVAS al usuario basándote en lo que ya ha visto y valorado.
 
-Responde SIEMPRE en JSON puro con este formato EXACTO:
+Tienes que tener en cuenta:
+- Las valoraciones generales, pero especialmente:
+  - "disfrute" (qué tanto disfrutó la película).
+  - "guion" (calidad de la historia).
+- Otros campos (dirección, actuación, BSO) también ayudan a reconocer patrones de gustos.
+
+Muy importante:
+- Las películas que ya aparecen en la lista de valoraciones del usuario SON PELÍCULAS YA VISTAS.
+- No vuelvas a recomendarlas como si fueran nuevas.
+- Recomienda OTRAS películas distintas, que encajen con sus gustos.
+- Si quieres, puedes mencionar la relación con las ya vistas en la explicación ("reason"), pero NO las repitas como recomendación principal.
+
+Responde SIEMPRE en JSON puro con este formato EXACTO (sin texto extra):
 
 {
   "recommendations": [
@@ -104,22 +129,29 @@ Responde SIEMPRE en JSON puro con este formato EXACTO:
 }
 `;
 
+    // 🧠 User prompt: datos concretos del usuario
     const userPrompt = `
 Usuario con uid=${uid}
 
-Estas son algunas de sus valoraciones:
+Estas son algunas de sus valoraciones (películas YA VISTAS):
 
 ${userMoviesForPrompt}
 
-Devuélveme hasta ${max} recomendaciones variadas, con "tmdbId" si lo conoces, "title" y "reason" clara y breve.
-Si dudas, sugiere también películas similares a las mejor valoradas por el usuario.
-No añadas explicaciones fuera del JSON.
+Listado breve de títulos ya vistos:
+${seenTitlesList || "(sin títulos conocidos)"}
+
+Tarea:
+- Devuélveme hasta ${max} recomendaciones VARIADAS de películas que NO estén en esa lista de ya vistas.
+- Ten MUY en cuenta sobre todo el "disfrute" y el "guion" para saber qué tipo de historias le gustan.
+- En "reason" explica brevemente por qué se la recomiendas, mencionando si se parece en tono, tipo de guion, ritmo o sensaciones a alguna de las pelis mejor valoradas.
+- Si conoces el "tmdbId" de la película, inclúyelo. Si no lo conoces, puedes omitirlo o poner null.
+- No añadas nada fuera del JSON.
 `;
 
     let finalRecs: AiRecommendation[] = [];
 
     try {
-      // Vercel (Node 18+) ya tiene fetch global, no hace falta node-fetch
+      // Llamada a Gemini
       const geminiResponse = await fetch(
         `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${GEMINI_API_KEY}`,
         {
@@ -135,7 +167,6 @@ No añadas explicaciones fuera del JSON.
       );
 
       if (!geminiResponse.ok) {
-        // Log en servidor para que lo veas en Vercel
         console.error("Gemini status:", geminiResponse.status);
         const textErr = await geminiResponse.text();
         console.error("Gemini body:", textErr);
@@ -169,10 +200,21 @@ No añadas explicaciones fuera del JSON.
           ? parsed.recommendations
           : [];
 
-        finalRecs = arr.filter(
+        // 🔍 Filtramos recomendaciones sin título
+        let cleaned = arr.filter(
           (r) => r && r.title && r.title.toString().trim().length > 0
         );
 
+        // 🔍 EXTRA: filtramos películas que ya están en sus valoraciones (por título, insensible a mayúsculas)
+        cleaned = cleaned.filter((r) => {
+          const t = r.title.toString().toLowerCase().trim();
+          if (!t) return false;
+          return !ratedTitlesSet.has(t);
+        });
+
+        finalRecs = cleaned;
+
+        // Si la IA no da nada útil, usamos fallback local
         if (!finalRecs.length) {
           finalRecs = localFallback;
         }
@@ -188,7 +230,7 @@ No añadas explicaciones fuera del JSON.
     });
   } catch (e: any) {
     console.error("Error general en /api/recommendations:", e);
-    // Última red de seguridad, pero muy raro que llegue aquí
+    // Última red de seguridad
     return res.status(500).json({
       error: "Error interno en el servidor.",
       info: e?.message ?? "unknown",
