@@ -102,12 +102,7 @@ export default async function handler(
         reason: `Te la recomiendo porque la valoraste con un ${r.overall}/10 (guion ${r.guion}/10, disfrute ${r.disfrute}/10).`,
       }));
 
-    if (!GEMINI_API_KEY) {
-      return res.status(200).json({
-        recommendations: localFallback,
-        info: "Devueltas solo recomendaciones locales (sin IA, falta GEMINI_API_KEY).",
-      });
-    }
+    
 
     // 2) Preparamos prompt para Gemini
     const subsetForPrompt = ratings.slice(0, 80);
