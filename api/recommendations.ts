@@ -12,7 +12,7 @@ type IncomingRating = {
   actuacion: number;
   bso: number;
   disfrute: number;
-  title?: string; // ahora SÍ esperamos que lleguen
+  title?: string; // ahora sí esperamos título
   year?: string;
 };
 
@@ -26,6 +26,23 @@ export type AiRecommendation = {
 type ApiResponse =
   | { error: string; info?: string }
   | { recommendations: AiRecommendation[]; info?: string };
+
+// 🔧 Función para normalizar títulos: minúsculas, sin año entre paréntesis, sin dobles espacios
+function normalizeTitle(raw: string | undefined | null): string {
+  if (!raw) return "";
+  let t = raw.toLowerCase().trim();
+
+  // Quitar " (1994)" o cosas entre paréntesis al final
+  t = t.replace(/\s*\([^)]*\)\s*$/g, "");
+
+  // Quitar espacios duplicados
+  t = t.replace(/\s+/g, " ");
+
+  // Quitar algunos signos de puntuación típicos que cambian poco el sentido
+  t = t.replace(/[:\-–_]/g, "").trim();
+
+  return t;
+}
 
 export default async function handler(
   req: NextApiRequest,
@@ -58,14 +75,21 @@ export default async function handler(
 
     const max = typeof maxItems === "number" && maxItems > 0 ? maxItems : 15;
 
-    // 🔹 Conjunto de títulos ya vistos (para evitar recomendar lo mismo cuando usemos IA)
+    // 🔹 Conjunto de títulos YA vistos normalizados
     const ratedTitlesSet = new Set(
       ratings
-        .map((r) => (r.title ?? "").toLowerCase().trim())
+        .map((r) => normalizeTitle(r.title))
         .filter((t) => t.length > 0)
     );
 
-    // 1) Fallback local: ordenar por nota global y usar eso si la IA falla
+    // 🔹 Conjunto de tmdbIds YA vistos (por si Gemini nos los devuelve)
+    const ratedIdsSet = new Set(
+      ratings
+        .map((r) => r.tmdbId)
+        .filter((id) => typeof id === "number" && id > 0)
+    );
+
+    // 1) Fallback local: ordenar por nota global (esto sí puede repetir vistas)
     const sortedByOverall = [...ratings].sort(
       (a, b) => b.overall - a.overall
     );
@@ -78,7 +102,6 @@ export default async function handler(
         reason: `Te la recomiendo porque la valoraste con un ${r.overall}/10 (guion ${r.guion}/10, disfrute ${r.disfrute}/10).`,
       }));
 
-    // Si NO hay API key, devolvemos únicamente el fallback local (pero sin error 500)
     if (!GEMINI_API_KEY) {
       return res.status(200).json({
         recommendations: localFallback,
@@ -103,7 +126,6 @@ export default async function handler(
       .filter((t): t is string => !!t && t.trim().length > 0)
       .join(", ");
 
-    // 🧠 System prompt: rol del modelo + formato JSON estricto
     const systemPrompt = `
 Eres un recomendador de cine para un grupo de amigos.
 Tu objetivo es recomendar películas NUEVAS al usuario basándote en lo que ya ha visto y valorado.
@@ -129,7 +151,6 @@ Responde SIEMPRE en JSON puro con este formato EXACTO (sin texto extra):
 }
 `;
 
-    // 🧠 User prompt: datos concretos del usuario
     const userPrompt = `
 Usuario con uid=${uid}
 
@@ -151,7 +172,6 @@ Tarea:
     let finalRecs: AiRecommendation[] = [];
 
     try {
-      // Llamada a Gemini
       const geminiResponse = await fetch(
         `https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key=${GEMINI_API_KEY}`,
         {
@@ -170,8 +190,6 @@ Tarea:
         console.error("Gemini status:", geminiResponse.status);
         const textErr = await geminiResponse.text();
         console.error("Gemini body:", textErr);
-
-        // Aún así respondemos 200 con el fallback, no 500
         finalRecs = localFallback;
       } else {
         const geminiJson: any = await geminiResponse.json();
@@ -205,16 +223,22 @@ Tarea:
           (r) => r && r.title && r.title.toString().trim().length > 0
         );
 
-        // 🔍 EXTRA: filtramos películas que ya están en sus valoraciones (por título, insensible a mayúsculas)
+        // 🔍 NORMALIZAMOS título recomendado y filtramos los ya vistos
         cleaned = cleaned.filter((r) => {
-          const t = r.title.toString().toLowerCase().trim();
-          if (!t) return false;
-          return !ratedTitlesSet.has(t);
+          const tNorm = normalizeTitle(r.title);
+          if (!tNorm) return false;
+
+          // 1) Si el título normalizado ya está en las valoraciones → fuera
+          if (ratedTitlesSet.has(tNorm)) return false;
+
+          // 2) Si trae tmdbId y ya lo ha valorado → fuera
+          if (r.tmdbId && ratedIdsSet.has(r.tmdbId)) return false;
+
+          return true;
         });
 
         finalRecs = cleaned;
 
-        // Si la IA no da nada útil, usamos fallback local
         if (!finalRecs.length) {
           finalRecs = localFallback;
         }
@@ -230,11 +254,11 @@ Tarea:
     });
   } catch (e: any) {
     console.error("Error general en /api/recommendations:", e);
-    // Última red de seguridad
     return res.status(500).json({
       error: "Error interno en el servidor.",
       info: e?.message ?? "unknown",
     });
   }
 }
+
 
