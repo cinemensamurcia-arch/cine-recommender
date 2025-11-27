@@ -74,6 +74,106 @@ async function fetchTitleYearFromTmdb(
   }
 }
 
+// Fallback: si la IA no devuelve nada útil, tiramos de TMDB "popular"
+// y filtramos las pelis que ya has visto
+async function fallbackPopularFromTmdb(
+  seenIds: number[],
+  max: number
+): Promise<AiRecommendation[]> {
+  const result: AiRecommendation[] = [];
+
+  try {
+    if (!TMDB_API_KEY) {
+      console.error("Falta TMDB_API_KEY, no se puede usar fallbackPopularFromTmdb");
+      return [];
+    }
+
+    const resp = await fetch(
+      `https://api.themoviedb.org/3/movie/popular?api_key=${TMDB_API_KEY}&language=es-ES&page=1`
+    );
+
+    if (!resp.ok) {
+      console.error("TMDB popular error status:", resp.status);
+      return [];
+    }
+
+    const data: any = await resp.json();
+    const results: any[] = Array.isArray(data?.results) ? data.results : [];
+
+    const seenSet = new Set(seenIds);
+
+    for (const m of results) {
+      if (result.length >= max) break;
+
+      const id: number = m.id;
+      if (!id || seenSet.has(id)) continue;
+
+      const title: string = m.title ?? "";
+      if (!title.trim()) continue;
+
+      const overview: string = m.overview ?? "";
+      const vote: number = typeof m.vote_average === "number" ? m.vote_average : 0;
+      const releaseDate: string = m.release_date ?? "";
+      const year =
+        releaseDate && releaseDate.length >= 4
+          ? releaseDate.substring(0, 4)
+          : "";
+
+      // Razones un poco más humanas (aunque no sean hiper personalizadas)
+      const fragments: string[] = [];
+
+      if (vote >= 7.5) {
+        fragments.push(
+          `Es una película muy bien valorada por el público, con una media de alrededor de ${vote.toFixed(
+            1
+          )}/10.`
+        );
+      } else if (vote > 0) {
+        fragments.push(
+          `Tiene una recepción bastante positiva entre la gente, con una puntuación media cercana a ${vote.toFixed(
+            1
+          )}/10.`
+        );
+      }
+
+      if (overview) {
+        fragments.push(
+          `La historia que cuenta suele enganchar por su planteamiento y la manera en que desarrolla a sus personajes.`
+        );
+      }
+
+      if (year) {
+        fragments.push(
+          `Además, al ser de ${year}, mantiene un estilo y un ritmo que siguen funcionando muy bien hoy en día.`
+        );
+      } else {
+        fragments.push(
+          `Su mezcla de ritmo, tono y atmósfera la hace una buena candidata para una sesión de cine que se disfrute sin complicaciones.`
+        );
+      }
+
+      if (!fragments.length) {
+        fragments.push(
+          `Es una de las películas populares del momento y puede encajar bien como próxima opción si buscas algo entretenido.`
+        );
+      }
+
+      const reason = fragments.join(" ");
+
+      result.push({
+        tmdbId: id,
+        title,
+        reason,
+      });
+    }
+  } catch (e) {
+    console.error("Error en fallbackPopularFromTmdb:", e);
+    return [];
+  }
+
+  return result;
+}
+
 export default async function handler(
   req: NextApiRequest,
   res: NextApiResponse<ApiResponse>
@@ -105,7 +205,6 @@ export default async function handler(
 
     const max = typeof maxItems === "number" && maxItems > 0 ? maxItems : 15;
 
-    // Si NO hay GEMINI_API_KEY, no tiene sentido seguir: así evitamos el fallback feo
     if (!GEMINI_API_KEY) {
       return res.status(500).json({
         error:
@@ -116,7 +215,6 @@ export default async function handler(
     // 0) Enriquecer ratings con título y año desde TMDB (si hace falta)
     const ratings: IncomingRating[] = await Promise.all(
       rawRatings.map(async (r) => {
-        // Si ya viene título o no hay TMDB_KEY, devolvemos tal cual
         if (r.title || !TMDB_API_KEY) return r;
 
         const extra = await fetchTitleYearFromTmdb(r.tmdbId);
@@ -137,11 +235,11 @@ export default async function handler(
     );
 
     // Conjunto de tmdbIds YA vistos
-    const ratedIdsSet = new Set(
-      ratings
-        .map((r) => r.tmdbId)
-        .filter((id) => typeof id === "number" && id > 0)
-    );
+    const ratedIds = ratings
+      .map((r) => r.tmdbId)
+      .filter((id) => typeof id === "number" && id > 0);
+
+    const ratedIdsSet = new Set(ratedIds);
 
     // 1) Preparar texto de valoraciones para el prompt
     const subsetForPrompt = ratings.slice(0, 80);
@@ -159,8 +257,6 @@ export default async function handler(
       .map((r) => r.title)
       .filter((t): t is string => !!t && t.trim().length > 0)
       .join(", ");
-
-    // 2) Prompts para Gemini
 
     const systemPrompt = `
 Eres un recomendador de cine para un grupo de amigos.
@@ -235,10 +331,12 @@ Tarea:
         const textErr = await geminiResponse.text();
         console.error("Gemini body:", textErr);
 
-        // Si Gemini falla, preferimos decir "sin recomendaciones" que devolver tus propias pelis
+        // 👉 Fallback a TMDB popular
+        const fallback = await fallbackPopularFromTmdb(ratedIds, max);
         return res.status(200).json({
-          recommendations: [],
-          info: "La IA no ha podido generar recomendaciones (error en Gemini).",
+          recommendations: fallback,
+          info:
+            "La IA no ha podido responder correctamente; se han usado recomendaciones populares de TMDB.",
         });
       }
 
@@ -268,7 +366,6 @@ Tarea:
         ? parsed.recommendations
         : [];
 
-      // Filtrar sin título
       let cleaned = arr.filter(
         (r) => r && r.title && r.title.toString().trim().length > 0
       );
@@ -278,10 +375,7 @@ Tarea:
         const tNorm = normalizeTitle(r.title);
         if (!tNorm) return false;
 
-        // Si el título coincide con algo ya visto → fuera
         if (ratedTitlesSet.has(tNorm)) return false;
-
-        // Si tmdbId coincide con algo ya visto → fuera
         if (r.tmdbId && ratedIdsSet.has(r.tmdbId)) return false;
 
         return true;
@@ -289,20 +383,22 @@ Tarea:
 
       finalRecs = cleaned.slice(0, max);
 
-      // Si después de filtrar no queda nada, devolvemos vacío, no tus propias pelis
       if (!finalRecs.length) {
+        // 👉 Si después de filtrar no queda nada, fallback TMDB
+        const fallback = await fallbackPopularFromTmdb(ratedIds, max);
         return res.status(200).json({
-          recommendations: [],
+          recommendations: fallback,
           info:
-            "La IA ha respondido, pero todas las películas que proponía parecían ya vistas o no válidas.",
+            "La IA ha respondido, pero todas las pelis parecían vistas o inválidas; se han usado recomendaciones populares de TMDB.",
         });
       }
     } catch (e) {
       console.error("Error al llamar a Gemini:", e);
+      const fallback = await fallbackPopularFromTmdb(ratedIds, max);
       return res.status(200).json({
-        recommendations: [],
+        recommendations: fallback,
         info:
-          "La IA no ha podido generar recomendaciones por un error inesperado.",
+          "La IA no ha podido generar recomendaciones; se han usado recomendaciones populares de TMDB.",
       });
     }
 
@@ -318,5 +414,4 @@ Tarea:
     });
   }
 }
-
 
