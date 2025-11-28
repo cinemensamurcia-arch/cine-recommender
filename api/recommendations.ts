@@ -260,7 +260,240 @@ export default async function handler(
       console.error("Falta GEMINI_API_KEY en el entorno de Vercel");
       return res.status(500).json({
         error:
-          "Gemini no está configur
+          "Gemini no está configurado en el servidor (falta GEMINI_API_KEY).",
+        info: "Configura GEMINI_API_KEY en Vercel y vuelve a desplegar.",
+      });
+    }
+
+    // ------------------------------
+    //  Prompt para que Gemini genere NUEVAS películas
+    //  (no basadas en /recommendations de TMDB)
+    // ------------------------------
+
+    const systemPrompt = `
+Eres un recomendador de cine para un grupo de amigos.
+
+Tienes:
+
+1) Una lista de valoraciones del usuario (con notas a:
+   - guion
+   - dirección
+   - actuación
+   - banda sonora
+   - disfrute general)
+
+TU TAREA:
+
+- Analizar qué le gusta realmente a esta persona:
+  - Qué tipo de historias suele disfrutar.
+  - Si valora más el guion, el disfrute, las actuaciones, la BSO, etc.
+- A partir de eso, recomendarle NUEVAS películas que encajen con su perfil de gustos.
+- Esas nuevas películas NO deben estar en la lista de películas que ya ha visto.
+- Cada recomendación debe ir acompañada de una explicación en español, de 3–6 frases,
+  natural y humana, de por qué crees que le va a gustar.
+
+TONO Y CONTENIDO:
+
+- Usa un tono cercano, como si hablaras directamente a la persona: "tú".
+- En cada recomendación:
+  - Menciona explícitamente al menos UNA de las películas que ha visto,
+    del estilo: "Como te gustó el guion de X…", "Igual que en X, aquí también…".
+  - Di cosas concretas: guion, personajes, ritmo, atmósfera, humor,
+    fotografía, música, temas que trata, cómo se siente al verla, etc.
+  - Relaciona la recomendación con sus gustos:
+    - Si el usuario suele poner nota alta al guion, resalta el guion.
+    - Si suele valorar mucho el disfrute, habla de lo entretenida que es.
+    - Si valora la BSO, menciona la música.
+    - Si ves que suele fijarse en la dirección o la actuación, coméntalo.
+- Varía el estilo:
+  - En algunas recomendaciones céntrate más en la emoción.
+  - En otras, en el guion.
+  - En otras, en las actuaciones o la dirección.
+  - Evita repetir la misma estructura o frases tipo plantilla.
+
+REGLAS IMPORTANTES:
+
+- SOLO puedes recomendar PELÍCULAS (no series) que NO aparezcan en la lista de películas que ya ha visto.
+- No inventes títulos inexistentes (deben ser películas reales).
+- Puedes recomendar películas de cualquier país y época, siempre que encajen con sus gustos.
+- No menciones plataformas, ni APIs, ni nada técnico.
+- No expliques el proceso interno ni hables de "modelo", "IA" o "prompt".
+- No añadas texto fuera del JSON.
+
+FORMATO DE RESPUESTA (OBLIGATORIO):
+
+Devuelve SIEMPRE JSON puro con este formato EXACTO:
+
+{
+  "recommendations": [
+    { "title": "Forrest Gump", "year": 1994, "reason": "..." }
+  ]
+}
+`;
+
+    const userPrompt = `
+Usuario con uid=${uid}.
+
+Estas son algunas de sus valoraciones (para que veas qué le gusta y qué valora):
+
+${userMoviesForPrompt}
+
+RECORDEMOS:
+- Todas estas películas YA las ha visto.
+- No vuelvas a recomendar ninguna de ellas.
+
+INSTRUCCIONES ESPECÍFICAS PARA ESTE USUARIO:
+
+- Recomienda hasta ${max} películas.
+- Tienen que ser películas REALES que no estén en la lista anterior.
+- Piensa qué le gustó de las películas que ya ha visto:
+  - Si suele poner notas altas al guion, dale importancia a historias bien escritas.
+  - Si valora mucho el disfrute, busca pelis con buen ritmo y que enganchen.
+  - Si cuida la actuación, destaca interpretaciones potentes.
+  - Si valora la música, resalta la BSO cuando tenga sentido.
+- En cada recomendación:
+  - Menciona al menos una de las películas que ha visto ("Como te gustó X…").
+  - Explica en 3–6 frases por qué esta película nueva encaja con sus gustos
+    (guion, tono, actuaciones, fotografía, banda sonora, ritmo, emoción, temas…).
+  - Haz que cada "reason" suene distinta, natural y humana, sin plantillas repetidas.
+
+Devuélveme las recomendaciones con este formato EXACTO, sin texto adicional:
+
+{
+  "recommendations": [
+    { "title": "Nombre", "year": 1999, "reason": "Texto en español..." }
+  ]
+}
+`;
+
+    const promptText = systemPrompt + "\n\n" + userPrompt;
+
+    // ------------------------------
+    // Llamada REAL a Gemini
+    // ------------------------------
+    let finalRecs: AiRecommendation[] = [];
+
+    try {
+      const geminiResponse = await fetch(
+        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            contents: [
+              {
+                role: "user",
+                parts: [{ text: promptText }],
+              },
+            ],
+          }),
+        }
+      );
+
+      if (!geminiResponse.ok) {
+        console.error("Gemini status:", geminiResponse.status);
+        const textErr = await geminiResponse.text();
+        console.error("Gemini body:", textErr);
+
+        // Si Gemini responde mal, usamos fallback simple
+        const fb = await fallbackSimpleFromTmdb(sortedByOverall, max, seenIds);
+        return res.status(200).json({
+          recommendations: fb,
+          info: `Gemini devolvió ${geminiResponse.status}, usando fallback basado en TMDB.`,
+        });
+      }
+
+      const geminiJson: any = await geminiResponse.json();
+      const candidates = geminiJson.candidates ?? [];
+      const parts = candidates[0]?.content?.parts ?? [];
+      const textPart: string = parts.map((p: any) => p.text || "").join("\n");
+
+      let parsed: { recommendations?: { title: string; year?: number | string; reason: string }[] } =
+        {};
+
+      try {
+        parsed = JSON.parse(textPart);
+      } catch (e) {
+        console.error("Error parseando JSON de Gemini:", e, textPart);
+        const match = textPart.match(/\{[\s\S]*\}/);
+        if (match) {
+          try {
+            parsed = JSON.parse(match[0]);
+          } catch (e2) {
+            console.error("Parseo 2 fallido:", e2);
+          }
+        }
+      }
+
+      const arr =
+        Array.isArray(parsed.recommendations) ? parsed.recommendations : [];
+
+      // Filtramos y limpiamos, evitando títulos ya vistos
+      const clean: { title: string; year?: number | string; reason: string }[] =
+        arr.filter((r) => {
+          if (!r || !r.title || !r.reason) return false;
+          const titleLower = r.title.toString().toLowerCase().trim();
+          if (!titleLower) return false;
+          if (seenTitlesLower.has(titleLower)) return false;
+          return true;
+        });
+
+      if (!clean.length) {
+        // Si Gemini no devuelve nada usable → fallback
+        const fb = await fallbackSimpleFromTmdb(sortedByOverall, max, seenIds);
+        return res.status(200).json({
+          recommendations: fb,
+          info: "Gemini devolvió recomendaciones vacías o repetidas, usando fallback basado en TMDB.",
+        });
+      }
+
+      // Intentamos enriquecer con tmdbId usando búsqueda por título/año
+      const enriched: AiRecommendation[] = [];
+      for (const r of clean.slice(0, max)) {
+        let tmdbId: number | undefined;
+        try {
+          tmdbId = await searchMovieOnTmdb(r.title, r.year);
+        } catch (e) {
+          console.error("Error buscando tmdbId para", r.title, e);
+        }
+
+        enriched.push({
+          tmdbId,
+          title: r.title,
+          reason: r.reason,
+        });
+      }
+
+      finalRecs = enriched;
+
+      if (!finalRecs.length) {
+        const fb = await fallbackSimpleFromTmdb(sortedByOverall, max, seenIds);
+        return res.status(200).json({
+          recommendations: fb,
+          info: "No se pudieron enriquecer recomendaciones de Gemini, usando fallback basado en TMDB.",
+        });
+      }
+    } catch (e) {
+      console.error("Error al llamar a Gemini:", e);
+      const fb = await fallbackSimpleFromTmdb(sortedByOverall, max, seenIds);
+      return res.status(200).json({
+        recommendations: fb,
+        info: "Excepción al llamar a Gemini, usando fallback basado en TMDB.",
+      });
+    }
+
+    return res.status(200).json({
+      recommendations: finalRecs.slice(0, max),
+      info: "Recomendaciones generadas por Gemini a partir de tus gustos (con búsqueda opcional en TMDB para tmdbId).",
+    });
+  } catch (e: any) {
+    console.error("Error general en /api/recommendations:", e);
+    return res.status(500).json({
+      error: "Error interno en el servidor.",
+      info: e?.message ?? "unknown",
+    });
+  }
+}
 
 
 
