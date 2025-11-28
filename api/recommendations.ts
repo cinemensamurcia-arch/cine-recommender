@@ -79,7 +79,7 @@ async function fetchMovieBasicFromTmdb(tmdbId: number): Promise<TmdbMovieBasic> 
 async function fetchRecommendedFromTmdb(
   baseTmdbId: number,
   baseTitle: string,
-  seenIds: Set<number>,
+  blockedIds: Set<number>, // ⬅️ antes era seenIds
   limitPerBase: number
 ): Promise<TmdbMovieBasic[]> {
   if (!TMDB_API_KEY) return [];
@@ -102,7 +102,7 @@ async function fetchRecommendedFromTmdb(
 
     const id = r.id;
     if (!id || typeof id !== "number") continue;
-    if (seenIds.has(id)) continue;
+    if (blockedIds.has(id)) continue; // ⬅️ NO recomendar vistas ni pendientes
 
     const title = r.title || r.original_title || `Película ${id}`;
     const date: string | undefined = r.release_date;
@@ -155,7 +155,7 @@ async function searchMovieOnTmdb(
 async function fallbackSimpleFromTmdb(
   topRatings: IncomingRating[],
   max: number,
-  seenIds: Set<number>
+  blockedIds: Set<number> // ⬅️ antes solo vistas, ahora vistas + pendientes
 ): Promise<AiRecommendation[]> {
   const result: AiRecommendation[] = [];
 
@@ -168,13 +168,13 @@ async function fallbackSimpleFromTmdb(
     const recs = await fetchRecommendedFromTmdb(
       r.tmdbId,
       baseTitle,
-      seenIds,
+      blockedIds,
       5
     );
 
     for (const rec of recs) {
       if (result.length >= max) break;
-      if (seenIds.has(rec.tmdbId)) continue;
+      if (blockedIds.has(rec.tmdbId)) continue; // ⬅️ seguridad extra
       if (result.some((x) => x.tmdbId === rec.tmdbId)) continue;
 
       const reason =
@@ -205,10 +205,11 @@ export default async function handler(
       return res.status(405).json({ error: "Método no permitido" });
     }
 
-    const { uid, ratings, maxItems } = req.body as {
+    const { uid, ratings, maxItems, pendingTmdbIds } = req.body as {
       uid?: string;
       ratings?: IncomingRating[];
       maxItems?: number;
+      pendingTmdbIds?: number[]; // ⬅️ NUEVO: array de tmdbId pendientes
     };
 
     if (!uid || !Array.isArray(ratings)) {
@@ -232,6 +233,18 @@ export default async function handler(
     // IDs que el usuario ya ha visto (para filtros y fallbacks)
     const seenIds = new Set<number>(ratings.map((r) => r.tmdbId));
 
+    // 🔹 NUEVO: IDs de pelis pendientes que llegan desde la app
+    const pendingIds = new Set<number>(
+      (pendingTmdbIds ?? []).filter(
+        (x) => typeof x === "number" && !Number.isNaN(x)
+      )
+    );
+
+    // 🔹 Conjunto final de IDs que NO se deben recomendar
+    const blockedIds = new Set<number>();
+    seenIds.forEach((id) => blockedIds.add(id));
+    pendingIds.forEach((id) => blockedIds.add(id));
+
     // Conjunto de títulos vistos (para que Gemini no repita)
     const seenTitlesLower = new Set(
       ratings
@@ -253,6 +266,14 @@ export default async function handler(
       })
       .join("\n");
 
+    // Lista de pendientes para el prompt (solo texto informativo)
+    const pendingListForPrompt =
+      pendingIds.size > 0
+        ? `\nEstas películas el usuario las tiene en su lista de PENDIENTES (no las recomiendes tampoco):\n${[
+            ...pendingIds,
+          ].join(", ")}\n`
+        : "";
+
     // ------------------------------
     //  Si no hay GEMINI_API_KEY → error claro
     // ------------------------------
@@ -267,7 +288,6 @@ export default async function handler(
 
     // ------------------------------
     //  Prompt para que Gemini genere NUEVAS películas
-    //  (no basadas en /recommendations de TMDB)
     // ------------------------------
 
     const systemPrompt = `
@@ -289,6 +309,7 @@ TU TAREA:
   - Si valora más el guion, el disfrute, las actuaciones, la BSO, etc.
 - A partir de eso, recomendarle NUEVAS películas que encajen con su perfil de gustos.
 - Esas nuevas películas NO deben estar en la lista de películas que ya ha visto.
+- Y TAMPOCO deben estar en su lista de "pendientes de ver".
 - Cada recomendación debe ir acompañada de una explicación en español, de 3–6 frases,
   natural y humana, de por qué crees que le va a gustar.
 
@@ -314,6 +335,7 @@ TONO Y CONTENIDO:
 REGLAS IMPORTANTES:
 
 - SOLO puedes recomendar PELÍCULAS (no series) que NO aparezcan en la lista de películas que ya ha visto.
+- Tampoco puedes recomendar películas que el usuario ya tenga en su lista de PENDIENTES.
 - No inventes títulos inexistentes (deben ser películas reales).
 - Puedes recomendar películas de cualquier país y época, siempre que encajen con sus gustos.
 - No menciones plataformas, ni APIs, ni nada técnico.
@@ -338,14 +360,17 @@ Estas son algunas de sus valoraciones (para que veas qué le gusta y qué valora
 
 ${userMoviesForPrompt}
 
+${pendingListForPrompt}
+
 RECORDEMOS:
-- Todas estas películas YA las ha visto.
-- No vuelvas a recomendar ninguna de ellas.
+- Todas las películas listadas arriba YA las ha visto.
+- Además, tiene una lista de PENDIENTES cuyos tmdbId te he pasado arriba.
+- No vuelvas a recomendar ninguna de las películas que ya ha visto NI ninguna de las pendientes.
 
 INSTRUCCIONES ESPECÍFICAS PARA ESTE USUARIO:
 
 - Recomienda hasta ${max} películas.
-- Tienen que ser películas REALES que no estén en la lista anterior.
+- Tienen que ser películas REALES que no estén en la lista anterior (ni vistas ni pendientes).
 - Piensa qué le gustó de las películas que ya ha visto:
   - Si suele poner notas altas al guion, dale importancia a historias bien escritas.
   - Si valora mucho el disfrute, busca pelis con buen ritmo y que enganchen.
@@ -396,7 +421,7 @@ Devuélveme las recomendaciones con este formato EXACTO, sin texto adicional:
         console.error("Gemini body:", textErr);
 
         // Si Gemini responde mal, usamos fallback simple
-        const fb = await fallbackSimpleFromTmdb(sortedByOverall, max, seenIds);
+        const fb = await fallbackSimpleFromTmdb(sortedByOverall, max, blockedIds);
         return res.status(200).json({
           recommendations: fb,
           info: `Gemini devolvió ${geminiResponse.status}, usando fallback basado en TMDB.`,
@@ -408,8 +433,9 @@ Devuélveme las recomendaciones con este formato EXACTO, sin texto adicional:
       const parts = candidates[0]?.content?.parts ?? [];
       const textPart: string = parts.map((p: any) => p.text || "").join("\n");
 
-      let parsed: { recommendations?: { title: string; year?: number | string; reason: string }[] } =
-        {};
+      let parsed: {
+        recommendations?: { title: string; year?: number | string; reason: string }[];
+      } = {};
 
       try {
         parsed = JSON.parse(textPart);
@@ -440,7 +466,7 @@ Devuélveme las recomendaciones con este formato EXACTO, sin texto adicional:
 
       if (!clean.length) {
         // Si Gemini no devuelve nada usable → fallback
-        const fb = await fallbackSimpleFromTmdb(sortedByOverall, max, seenIds);
+        const fb = await fallbackSimpleFromTmdb(sortedByOverall, max, blockedIds);
         return res.status(200).json({
           recommendations: fb,
           info: "Gemini devolvió recomendaciones vacías o repetidas, usando fallback basado en TMDB.",
@@ -464,10 +490,14 @@ Devuélveme las recomendaciones con este formato EXACTO, sin texto adicional:
         });
       }
 
-      finalRecs = enriched;
+      // ⬅️ FILTRO FINAL: no recomendar vistas ni pendientes por tmdbId
+      finalRecs = enriched.filter((r) => {
+        if (!r.tmdbId) return true; // si no sabemos id, no podemos filtrar
+        return !blockedIds.has(r.tmdbId);
+      });
 
       if (!finalRecs.length) {
-        const fb = await fallbackSimpleFromTmdb(sortedByOverall, max, seenIds);
+        const fb = await fallbackSimpleFromTmdb(sortedByOverall, max, blockedIds);
         return res.status(200).json({
           recommendations: fb,
           info: "No se pudieron enriquecer recomendaciones de Gemini, usando fallback basado en TMDB.",
@@ -475,7 +505,7 @@ Devuélveme las recomendaciones con este formato EXACTO, sin texto adicional:
       }
     } catch (e) {
       console.error("Error al llamar a Gemini:", e);
-      const fb = await fallbackSimpleFromTmdb(sortedByOverall, max, seenIds);
+      const fb = await fallbackSimpleFromTmdb(sortedByOverall, max, blockedIds);
       return res.status(200).json({
         recommendations: fb,
         info: "Excepción al llamar a Gemini, usando fallback basado en TMDB.",
@@ -484,7 +514,7 @@ Devuélveme las recomendaciones con este formato EXACTO, sin texto adicional:
 
     return res.status(200).json({
       recommendations: finalRecs.slice(0, max),
-      info: "Recomendaciones generadas por Gemini a partir de tus gustos (con búsqueda opcional en TMDB para tmdbId).",
+      info: "Recomendaciones generadas por Gemini a partir de tus gustos (filtrando vistas y pendientes, con búsqueda opcional en TMDB para tmdbId).",
     });
   } catch (e: any) {
     console.error("Error general en /api/recommendations:", e);
