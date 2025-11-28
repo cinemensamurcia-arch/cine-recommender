@@ -315,6 +315,7 @@ REGLAS IMPORTANTES:
 
 - SOLO puedes recomendar PELÍCULAS (no series) que NO aparezcan en la lista de películas que ya ha visto.
 - No inventes títulos inexistentes (deben ser películas reales).
+- Los títulos deben ser como se estrenó la película en España. En Español de España. No en inglés o en otro pais. Sino título de la película en España.
 - Puedes recomendar películas de cualquier país y época, siempre que encajen con sus gustos.
 - No menciones plataformas, ni APIs, ni nada técnico.
 - No expliques el proceso interno ni hables de "modelo", "IA" o "prompt".
