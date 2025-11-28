@@ -60,7 +60,10 @@ async function fetchMovieBasicFromTmdb(tmdbId: number): Promise<TmdbMovieBasic> 
   const json = await resp.json();
   const title = json.title || `Película ${tmdbId}`;
   const releaseDate: string | undefined = json.release_date;
-  const year = releaseDate && releaseDate.length >= 4 ? releaseDate.slice(0, 4) : undefined;
+  const year =
+    releaseDate && releaseDate.length >= 4
+      ? releaseDate.slice(0, 4)
+      : undefined;
   const overview: string | undefined = json.overview;
 
   return {
@@ -71,6 +74,8 @@ async function fetchMovieBasicFromTmdb(tmdbId: number): Promise<TmdbMovieBasic> 
   };
 }
 
+// Sigue existiendo para el fallback,
+// pero ya NO se usa en el flujo principal de Gemini.
 async function fetchRecommendedFromTmdb(
   baseTmdbId: number,
   baseTitle: string,
@@ -113,6 +118,37 @@ async function fetchRecommendedFromTmdb(
   }
 
   return list;
+}
+
+// Buscar una película en TMDB por título (y opcionalmente año)
+// solo para recuperar el tmdbId, pero la recomendación en sí viene de Gemini.
+async function searchMovieOnTmdb(
+  title: string,
+  year?: string | number
+): Promise<number | undefined> {
+  if (!TMDB_API_KEY) return undefined;
+
+  const query = encodeURIComponent(title);
+  const yearParam =
+    typeof year === "string" || typeof year === "number"
+      ? `&year=${encodeURIComponent(year.toString())}`
+      : "";
+
+  const url = `https://api.themoviedb.org/3/search/movie?api_key=${TMDB_API_KEY}&language=es-ES&query=${query}${yearParam}&page=1&include_adult=false`;
+
+  const resp = await fetch(url);
+  if (!resp.ok) {
+    console.error("TMDB /search error", resp.status, await resp.text());
+    return undefined;
+  }
+
+  const json = await resp.json();
+  const results: any[] = json.results || [];
+  if (!results.length) return undefined;
+
+  const best = results[0];
+  if (!best.id || typeof best.id !== "number") return undefined;
+  return best.id;
 }
 
 // Fallback sencillo (por si Gemini PETA de verdad)
@@ -191,48 +227,21 @@ export default async function handler(
     const max = typeof maxItems === "number" && maxItems > 0 ? maxItems : 15;
 
     // Ordenamos por nota global (mejores arriba)
-    const sortedByOverall = [...ratings].sort(
-      (a, b) => b.overall - a.overall
-    );
+    const sortedByOverall = [...ratings].sort((a, b) => b.overall - a.overall);
 
-    // IDs que el usuario ya ha visto (para no repetir)
+    // IDs que el usuario ya ha visto (para filtros y fallbacks)
     const seenIds = new Set<number>(ratings.map((r) => r.tmdbId));
 
+    // Conjunto de títulos vistos (para que Gemini no repita)
+    const seenTitlesLower = new Set(
+      ratings
+        .map((r) => r.title?.toLowerCase().trim())
+        .filter((t): t is string => !!t)
+    );
+
     // ------------------------------
-    // 1) Construir CANDIDATAS desde TMDB
-    // ------------------------------
-
-    const topForTmdb = sortedByOverall.slice(0, 10); // p.ej. sus 10 mejor valoradas
-    const candidateMap = new Map<number, TmdbMovieBasic>();
-
-    for (const r of topForTmdb) {
-      const baseInfo = await fetchMovieBasicFromTmdb(r.tmdbId);
-      const recs = await fetchRecommendedFromTmdb(
-        r.tmdbId,
-        baseInfo.title,
-        seenIds,
-        10
-      );
-      for (const rec of recs) {
-        if (candidateMap.size >= 80) break; // máximo 80 candidatas totales
-        if (seenIds.has(rec.tmdbId)) continue; // no recomendar vistas
-        if (candidateMap.has(rec.tmdbId)) continue;
-        candidateMap.set(rec.tmdbId, rec);
-      }
-    }
-
-    const candidateMovies = Array.from(candidateMap.values());
-
-    if (!candidateMovies.length) {
-      // Si por lo que sea TMDB no devuelve nada, usamos fallback simple
-      const fb = await fallbackSimpleFromTmdb(sortedByOverall, max, seenIds);
-      return res.status(200).json({
-        recommendations: fb,
-        info: "TMDB no ha devuelto candidatas, usando fallback simple.",
-      });
-    }
-
     // Texto con valoraciones del usuario para el prompt
+    // ------------------------------
     const subsetForPrompt = sortedByOverall.slice(0, 80);
 
     const userMoviesForPrompt = subsetForPrompt
@@ -244,224 +253,15 @@ export default async function handler(
       })
       .join("\n");
 
-    // Texto con candidatas para el prompt
-    const candidatesForPrompt = candidateMovies
-      .map((m) => {
-        const yearText = m.year ? ` (${m.year})` : "";
-        const ov = m.overview ? m.overview.slice(0, 250) : "";
-        return `- [${m.tmdbId}] ${m.title}${yearText}: ${ov}`;
-      })
-      .join("\n");
-
     // ------------------------------
-    // 2) Si no hay GEMINI_API_KEY → error claro (no fallback silencioso)
+    //  Si no hay GEMINI_API_KEY → error claro
     // ------------------------------
     if (!GEMINI_API_KEY) {
       console.error("Falta GEMINI_API_KEY en el entorno de Vercel");
       return res.status(500).json({
         error:
-          "Gemini no está configurado en el servidor (falta GEMINI_API_KEY).",
-        info: "Configura GEMINI_API_KEY en Vercel y vuelve a desplegar.",
-      });
-    }
+          "Gemini no está configur
 
-    // ------------------------------
-    // 3) Prompt para Gemini
-    // ------------------------------
-
-    const systemPrompt = `
-Eres un recomendador de cine para un grupo de amigos.
-
-Tienes:
-
-1) Una lista de valoraciones del usuario (con notas a:
-   - guion
-   - dirección
-   - actuación
-   - banda sonora
-   - disfrute general)
-
-2) Una lista de PELÍCULAS CANDIDATAS que vienen de las recomendaciones de TMDB
-   a partir de películas que el usuario ha valorado muy bien.
-
-TU TAREA:
-
-- Elegir hasta N películas de esa lista de CANDIDATAS.
-- Para cada recomendación, escribir una explicación en español, de varias frases
-  (3–6 frases), natural y humana, de por qué crees que le va a gustar al usuario.
-- Usa un tono cercano, como si hablaras directamente a la persona: "tú".
-- Debes tener en cuenta:
-  - Qué tipo de historias disfruta (según las notas).
-  - Si valora más el guion, el disfrute, las actuaciones, la BSO, etc.
-  - El tono emocional, el ritmo, el tipo de personajes, los temas, la fotografía…
-
-INSTRUCCIONES CLAVE PARA LAS EXPLICACIONES:
-
-- En cada recomendación:
-  - Menciona explícitamente al menos UNA de las películas que ha visto,
-    del estilo: "Como te gustó el guion de X…", "Igual que en X, aquí también…".
-  - Di cosas concretas: habla de guion, personajes, ritmo, atmósfera, humor,
-    fotografía, música, temas que trata, cómo se siente al verla, etc.
-  - Relaciona la recomendación con sus gustos:
-    - Si el usuario suele poner nota alta al guion, resalta el guion.
-    - Si suele valorar mucho el disfrute, habla de lo entretenida que es.
-    - Si valora la BSO, menciona la música.
-- Varía el estilo:
-  - En unas recomendaciones céntrate más en la emoción.
-  - En otras, en el guion.
-  - En otras, en las actuaciones o la dirección.
-  - Evita repetir la misma estructura o frases tipo plantilla.
-
-REGLAS IMPORTANTES:
-
-- SOLO puedes usar las películas que te doy en la lista de CANDIDATAS.
-- NO inventes títulos nuevos.
-- NO recomiendes películas que no estén listadas.
-- NO menciones TMDB ni que vienen de una API.
-- NO digas frases tipo "Te la recomiendo porque la valoraste con X/10".
-- No expliques el proceso ni hables de "modelo", "IA", "prompt" ni nada técnico.
-- No añadas texto fuera del JSON.
-
-FORMATO DE RESPUESTA (OBLIGATORIO):
-
-Devuelve SIEMPRE JSON puro con este formato EXACTO:
-
-{
-  "recommendations": [
-    { "tmdbId": 13, "title": "Forrest Gump", "reason": "..." }
-  ]
-}
-`;
-
-    const userPrompt = `
-Usuario con uid=${uid}.
-
-Estas son algunas de sus valoraciones (para que veas qué le gusta y qué valora):
-
-${userMoviesForPrompt}
-
-Estas son las películas CANDIDATAS (todas recomendadas por TMDB a partir de pelis que le gustaron):
-
-${candidatesForPrompt}
-
-INSTRUCCIONES ESPECÍFICAS PARA ESTE USUARIO:
-
-- Elige SOLO entre esas CANDIDATAS.
-- Piensa qué le gustó de las películas que ya ha visto:
-  - Si suele poner notas altas al guion, dale importancia a historias bien escritas.
-  - Si valora mucho el disfrute, busca pelis con buen ritmo y que enganchen.
-  - Si cuida la actuación, destaca interpretaciones potentes.
-  - Si valora la música, resalta la BSO cuando tenga sentido.
-- En cada recomendación:
-  - Menciona al menos una de las películas que ha visto ("Como te gustó X…").
-  - Explica en 3–6 frases por qué esta película nueva encaja con sus gustos
-    (guion, tono, actuaciones, fotografía, banda sonora, ritmo, emoción, temas…).
-  - Haz que cada "reason" suene distinta, natural y humana, sin plantillas repetidas.
-
-Devuélveme hasta ${max} recomendaciones con este formato EXACTO, sin texto adicional:
-
-{
-  "recommendations": [
-    { "tmdbId": 123, "title": "Nombre", "reason": "Texto en español..." }
-  ]
-}
-`;
-
-    const promptText = systemPrompt + "\n\n" + userPrompt;
-
-    // ------------------------------
-    // 4) Llamada REAL a Gemini
-    // ------------------------------
-    let finalRecs: AiRecommendation[] = [];
-
-    try {
-      const geminiResponse = await fetch(
-        `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            contents: [
-              {
-                role: "user",
-                parts: [{ text: promptText }],
-              },
-            ],
-          }),
-        }
-      );
-
-      if (!geminiResponse.ok) {
-        console.error("Gemini status:", geminiResponse.status);
-        const textErr = await geminiResponse.text();
-        console.error("Gemini body:", textErr);
-
-        // Si Gemini responde mal, usamos fallback simple
-        const fb = await fallbackSimpleFromTmdb(sortedByOverall, max, seenIds);
-        return res.status(200).json({
-          recommendations: fb,
-          info: `Gemini devolvió ${geminiResponse.status}, usando fallback.`,
-        });
-      }
-
-      const geminiJson: any = await geminiResponse.json();
-      const candidates = geminiJson.candidates ?? [];
-      const parts = candidates[0]?.content?.parts ?? [];
-      const textPart: string = parts.map((p: any) => p.text || "").join("\n");
-
-      let parsed: { recommendations?: AiRecommendation[] } = {};
-
-      try {
-        parsed = JSON.parse(textPart);
-      } catch (e) {
-        console.error("Error parseando JSON de Gemini:", e, textPart);
-        const match = textPart.match(/\{[\s\S]*\}/);
-        if (match) {
-          try {
-            parsed = JSON.parse(match[0]);
-          } catch (e2) {
-            console.error("Parseo 2 fallido:", e2);
-          }
-        }
-      }
-
-      const arr = Array.isArray(parsed.recommendations)
-        ? parsed.recommendations
-        : [];
-
-      finalRecs = arr.filter(
-        (r) => r && r.title && r.title.toString().trim().length > 0
-      );
-
-      if (!finalRecs.length) {
-        // Si Gemini no devuelve nada usable → fallback
-        const fb = await fallbackSimpleFromTmdb(sortedByOverall, max, seenIds);
-        return res.status(200).json({
-          recommendations: fb,
-          info: "Gemini devolvió recomendaciones vacías, usando fallback.",
-        });
-      }
-    } catch (e) {
-      console.error("Error al llamar a Gemini:", e);
-      const fb = await fallbackSimpleFromTmdb(sortedByOverall, max, seenIds);
-      return res.status(200).json({
-        recommendations: fb,
-        info: "Excepción al llamar a Gemini, usando fallback.",
-      });
-    }
-
-    return res.status(200).json({
-      recommendations: finalRecs.slice(0, max),
-      info: "Recomendaciones devueltas por Gemini (con filtrado).",
-    });
-  } catch (e: any) {
-    console.error("Error general en /api/recommendations:", e);
-    return res.status(500).json({
-      error: "Error interno en el servidor.",
-      info: e?.message ?? "unknown",
-    });
-  }
-}
 
 
 
