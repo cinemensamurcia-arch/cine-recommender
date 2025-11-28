@@ -17,6 +17,12 @@ type IncomingRating = {
   year?: string;
 };
 
+type IncomingPending = {
+  tmdbId?: number;
+  title?: string;
+  year?: string | number;
+};
+
 // Lo que tu backend devuelve a Android
 export type AiRecommendation = {
   tmdbId?: number;
@@ -79,7 +85,7 @@ async function fetchMovieBasicFromTmdb(tmdbId: number): Promise<TmdbMovieBasic> 
 async function fetchRecommendedFromTmdb(
   baseTmdbId: number,
   baseTitle: string,
-  blockedIds: Set<number>, // ⬅️ antes era seenIds
+  blockedIds: Set<number>, // ⬅️ vistas + pendientes
   limitPerBase: number
 ): Promise<TmdbMovieBasic[]> {
   if (!TMDB_API_KEY) return [];
@@ -155,7 +161,7 @@ async function searchMovieOnTmdb(
 async function fallbackSimpleFromTmdb(
   topRatings: IncomingRating[],
   max: number,
-  blockedIds: Set<number> // ⬅️ antes solo vistas, ahora vistas + pendientes
+  blockedIds: Set<number> // vistas + pendientes
 ): Promise<AiRecommendation[]> {
   const result: AiRecommendation[] = [];
 
@@ -174,7 +180,7 @@ async function fallbackSimpleFromTmdb(
 
     for (const rec of recs) {
       if (result.length >= max) break;
-      if (blockedIds.has(rec.tmdbId)) continue; // ⬅️ seguridad extra
+      if (blockedIds.has(rec.tmdbId)) continue; // seguridad extra
       if (result.some((x) => x.tmdbId === rec.tmdbId)) continue;
 
       const reason =
@@ -205,11 +211,18 @@ export default async function handler(
       return res.status(405).json({ error: "Método no permitido" });
     }
 
-    const { uid, ratings, maxItems, pendingTmdbIds } = req.body as {
+    const {
+      uid,
+      ratings,
+      maxItems,
+      pendingTmdbIds,
+      pending,
+    } = req.body as {
       uid?: string;
       ratings?: IncomingRating[];
       maxItems?: number;
-      pendingTmdbIds?: number[]; // ⬅️ NUEVO: array de tmdbId pendientes
+      pendingTmdbIds?: number[];        // compatibilidad
+      pending?: IncomingPending[];      // ⬅️ NUEVO: pendientes por título
     };
 
     if (!uid || !Array.isArray(ratings)) {
@@ -233,24 +246,63 @@ export default async function handler(
     // IDs que el usuario ya ha visto (para filtros y fallbacks)
     const seenIds = new Set<number>(ratings.map((r) => r.tmdbId));
 
-    // 🔹 NUEVO: IDs de pelis pendientes que llegan desde la app
+    // Títulos vistos (para filtro por título)
+    const seenTitlesLower = new Set(
+      ratings
+        .map((r) => r.title?.toLowerCase().trim())
+        .filter((t): t is string => !!t)
+    );
+
+    // 🔹 NUEVO: pendientes por título
+    const pendingTitlesLower = new Set<string>();
+    if (Array.isArray(pending)) {
+      for (const p of pending) {
+        if (!p?.title) continue;
+        const t = p.title.toLowerCase().trim();
+        if (t) pendingTitlesLower.add(t);
+      }
+    }
+
+    // 🔹 NUEVO: IDs de pelis pendientes (IDs + los que se puedan resolver por título)
     const pendingIds = new Set<number>(
       (pendingTmdbIds ?? []).filter(
         (x) => typeof x === "number" && !Number.isNaN(x)
       )
     );
 
+    // Si nos llegan pendientes con tmdbId directo, los añadimos también
+    if (Array.isArray(pending)) {
+      for (const p of pending) {
+        if (p?.tmdbId && typeof p.tmdbId === "number" && !Number.isNaN(p.tmdbId)) {
+          pendingIds.add(p.tmdbId);
+        }
+      }
+    }
+
+    // Intentar resolver tmdbId a partir de título/año de pendientes (si hay API TMDB)
+    if (Array.isArray(pending) && TMDB_API_KEY) {
+      for (const p of pending) {
+        if (!p?.title) continue;
+        try {
+          const id = await searchMovieOnTmdb(p.title, p.year);
+          if (id && !Number.isNaN(id)) {
+            pendingIds.add(id);
+          }
+        } catch (e) {
+          console.error("Error resolviendo tmdbId de pendiente", p.title, e);
+        }
+      }
+    }
+
     // 🔹 Conjunto final de IDs que NO se deben recomendar
     const blockedIds = new Set<number>();
     seenIds.forEach((id) => blockedIds.add(id));
     pendingIds.forEach((id) => blockedIds.add(id));
 
-    // Conjunto de títulos vistos (para que Gemini no repita)
-    const seenTitlesLower = new Set(
-      ratings
-        .map((r) => r.title?.toLowerCase().trim())
-        .filter((t): t is string => !!t)
-    );
+    // 🔹 Conjunto final de títulos que NO se deben recomendar
+    const blockedTitlesLower = new Set<string>();
+    seenTitlesLower.forEach((t) => blockedTitlesLower.add(t));
+    pendingTitlesLower.forEach((t) => blockedTitlesLower.add(t));
 
     // ------------------------------
     // Texto con valoraciones del usuario para el prompt
@@ -268,10 +320,12 @@ export default async function handler(
 
     // Lista de pendientes para el prompt (solo texto informativo)
     const pendingListForPrompt =
-      pendingIds.size > 0
+      pendingTitlesLower.size > 0
         ? `\nEstas películas el usuario las tiene en su lista de PENDIENTES (no las recomiendes tampoco):\n${[
-            ...pendingIds,
-          ].join(", ")}\n`
+            ...pendingTitlesLower,
+          ]
+            .map((t) => `- ${t}`)
+            .join("\n")}\n`
         : "";
 
     // ------------------------------
@@ -301,6 +355,7 @@ Tienes:
    - actuación
    - banda sonora
    - disfrute general)
+2) Una lista de películas que el usuario TIENE PENDIENTES de ver.
 
 TU TAREA:
 
@@ -364,7 +419,7 @@ ${pendingListForPrompt}
 
 RECORDEMOS:
 - Todas las películas listadas arriba YA las ha visto.
-- Además, tiene una lista de PENDIENTES cuyos tmdbId te he pasado arriba.
+- Además, tiene una lista de PENDIENTES cuyas películas también aparecen arriba (no las recomiendes).
 - No vuelvas a recomendar ninguna de las películas que ya ha visto NI ninguna de las pendientes.
 
 INSTRUCCIONES ESPECÍFICAS PARA ESTE USUARIO:
@@ -454,13 +509,13 @@ Devuélveme las recomendaciones con este formato EXACTO, sin texto adicional:
       const arr =
         Array.isArray(parsed.recommendations) ? parsed.recommendations : [];
 
-      // Filtramos y limpiamos, evitando títulos ya vistos
+      // Filtramos y limpiamos, evitando títulos ya vistos o pendientes
       const clean: { title: string; year?: number | string; reason: string }[] =
         arr.filter((r) => {
           if (!r || !r.title || !r.reason) return false;
           const titleLower = r.title.toString().toLowerCase().trim();
           if (!titleLower) return false;
-          if (seenTitlesLower.has(titleLower)) return false;
+          if (blockedTitlesLower.has(titleLower)) return false; // ⬅️ vistas + pendientes
           return true;
         });
 
@@ -490,9 +545,9 @@ Devuélveme las recomendaciones con este formato EXACTO, sin texto adicional:
         });
       }
 
-      // ⬅️ FILTRO FINAL: no recomendar vistas ni pendientes por tmdbId
+      // FILTRO FINAL: no recomendar vistas ni pendientes por tmdbId
       finalRecs = enriched.filter((r) => {
-        if (!r.tmdbId) return true; // si no sabemos id, no podemos filtrar
+        if (!r.tmdbId) return true; // si no sabemos id, no podemos filtrar por id
         return !blockedIds.has(r.tmdbId);
       });
 
@@ -524,6 +579,7 @@ Devuélveme las recomendaciones con este formato EXACTO, sin texto adicional:
     });
   }
 }
+
 
 
 
