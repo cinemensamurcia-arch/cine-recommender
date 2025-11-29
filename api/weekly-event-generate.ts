@@ -1,235 +1,293 @@
 // pages/api/weekly-event-generate.ts
 import type { NextApiRequest, NextApiResponse } from "next";
+import { db } from "../../lib/firestoreAdmin";
+import { fetchTopFromAppRanking, AppTopMovie } from "../../helpers/fetchTopFromAppRanking";
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-const TMDB_API_KEY = process.env.TMDB_API_KEY;
 
-// ---------- Tipos que usará la app Android ----------
-
-type WeeklyCandidateDto = {
+type WeeklyEventCandidate = {
   tmdbId: number;
   title: string;
   year?: number;
 };
 
-type WeeklyEventDto = {
+export type WeeklyEventDto = {
   id: string;
   theme: string;
-  description: string;
+  shortDescription: string;
+  longArticle: string;
+  imagePrompt?: string;
+  imageUrl?: string | null;
   startVoteDate: string;
   endVoteDate: string;
-  candidates: WeeklyCandidateDto[];
+  startWatchDate: string;
+  endWatchDate: string;
+  startForumDate: string;
+  endForumDate: string;
+  phase: "VOTING" | "WATCHING" | "FORUM" | "FINISHED";
+  candidates: WeeklyEventCandidate[];
 };
 
-type ApiResponse =
-  | { error: string; info?: string }
-  | { event: WeeklyEventDto };
-
-// ---------- Helpers TMDB ----------
-
-type TmdbMovieBasic = {
-  tmdbId: number;
-  title: string;
-  year?: number;
-  overview?: string;
-};
-
-async function fetchTopRatedFromTmdb(limit: number): Promise<TmdbMovieBasic[]> {
-  if (!TMDB_API_KEY) {
-    console.error("Falta TMDB_API_KEY en el entorno");
-    return [];
-  }
-
-  const url = `https://api.themoviedb.org/3/movie/top_rated?api_key=${TMDB_API_KEY}&language=es-ES&page=1`;
-  const resp = await fetch(url);
-
-  if (!resp.ok) {
-    console.error("TMDB /top_rated error", resp.status, await resp.text());
-    return [];
-  }
-
-  const json = await resp.json();
-  const results: any[] = json.results || [];
-  const list: TmdbMovieBasic[] = [];
-
-  for (const r of results) {
-    if (list.length >= limit) break;
-
-    const id = r.id;
-    if (!id || typeof id !== "number") continue;
-
-    const title = r.title || r.original_title || `Película ${id}`;
-    const date: string | undefined = r.release_date;
-    const year =
-      date && date.length >= 4 ? parseInt(date.slice(0, 4), 10) : undefined;
-    const overview: string | undefined = r.overview;
-
-    list.push({
-      tmdbId: id,
-      title,
-      year,
-      overview,
-    });
-  }
-
-  return list;
-}
-
-// ---------- Gemini: generar tema + descripción ----------
-
-async function generateEventWithGemini(
-  candidates: TmdbMovieBasic[]
-): Promise<{ theme: string; description: string }> {
-  if (!GEMINI_API_KEY) {
-    console.error("Falta GEMINI_API_KEY en el entorno");
-    return {
-      theme: "Semana de cine recomendada",
-      description:
-        "Un evento semanal con películas muy bien valoradas para descubrir nuevas historias juntos.",
-    };
-  }
-
-  // Texto con la info de las candidatas
-  const moviesText = candidates
-    .map((m) => {
-      const yearText = m.year ? ` (${m.year})` : "";
-      const overview = m.overview || "";
-      return `- ${m.title}${yearText}: ${overview}`;
-    })
-    .join("\n");
-
-  const prompt = `
-Eres el organizador creativo de un cineclub.
-
-Te doy una lista de 3 películas candidatas para la "Semana del Cine":
-
-${moviesText}
-
-TU TAREA:
-
-1. Inventar un TEMA para la semana (por ejemplo: "Semana de giros inesperados", "Viajes que te cambian la vida", "Risas y corazones").
-2. Escribir una DESCRIPCIÓN del evento en ESPAÑOL, con 5–8 frases, hablando de:
-   - qué tienen en común estas películas,
-   - qué tipo de experiencia ofrece esta semana,
-   - por qué puede gustarle a un grupo de amigos que ve cine juntos,
-   - el tono general (emocional, divertido, intenso, reflexivo, etc.).
-
-TONO:
-
-- Cercano, cálido, natural.
-- Dirigido a "vosotros" (segunda persona plural).
-- NO menciones APIs, ni modelos, ni nada técnico.
-
-FORMATO DE RESPUESTA (OBLIGATORIO):
-
-Devuelve SOLO JSON, sin texto extra, con este formato EXACTO:
-
-{
-  "theme": "Nombre del tema",
-  "description": "Texto largo en español..."
-}
-`;
-
-  const resp = await fetch(
-    `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`,
-    {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        contents: [
-          {
-            role: "user",
-            parts: [{ text: prompt }],
-          },
-        ],
-      }),
-    }
-  );
-
-  if (!resp.ok) {
-    console.error("Gemini status:", resp.status);
-    const body = await resp.text();
-    console.error("Gemini body:", body);
-
-    return {
-      theme: "Semana de cine recomendada",
-      description:
-        "Un evento semanal con películas muy bien valoradas para descubrir nuevas historias juntos.",
-    };
-  }
-
-  const data: any = await resp.json();
-  const candidatesOut = data.candidates ?? [];
-  const parts = candidatesOut[0]?.content?.parts ?? [];
-  const textPart: string = parts.map((p: any) => p.text || "").join("\n");
-
-  let theme = "Semana de cine recomendada";
-  let description =
-    "Un evento semanal con películas muy bien valoradas para descubrir nuevas historias juntos.";
-
-  try {
-    const parsed = JSON.parse(textPart);
-    if (parsed.theme && parsed.description) {
-      theme = parsed.theme.toString();
-      description = parsed.description.toString();
-    } else {
-      console.error("JSON de Gemini sin claves theme/description:", textPart);
-    }
-  } catch (e) {
-    console.error("Error parseando JSON de Gemini:", e, textPart);
-  }
-
-  return { theme, description };
-}
-
-// ---------- Handler principal ----------
+type ApiResponse = { error?: string; info?: string } | WeeklyEventDto;
 
 export default async function handler(
   req: NextApiRequest,
   res: NextApiResponse<ApiResponse>
 ) {
   try {
-    if (req.method !== "GET") {
-      res.setHeader("Allow", "GET");
+    // ⚠️ Este endpoint lo llamará SOLO el CRON de Vercel,
+    // puedes protegerlo con un token en cabecera si quieres.
+    if (req.method !== "POST") {
       return res.status(405).json({ error: "Método no permitido" });
     }
 
-    // 1) Sacamos 3 pelis top de TMDB como candidatas
-    const topMovies = await fetchTopRatedFromTmdb(10);
-    if (!topMovies.length) {
+    if (!GEMINI_API_KEY) {
       return res.status(500).json({
-        error: "No se han podido obtener películas de TMDB.",
+        error: "Gemini no está configurado (falta GEMINI_API_KEY).",
       });
     }
 
-    const candidates = topMovies.slice(0, 3);
+    // 1) Leemos el top 80 de TU ranking
+    const topMovies: AppTopMovie[] = await fetchTopFromAppRanking(80);
 
-    // 2) Pedimos a Gemini un tema y descripción para este pack
-    const { theme, description } = await generateEventWithGemini(candidates);
+    if (!topMovies.length) {
+      return res.status(400).json({
+        error: "No hay datos suficientes en el ranking global.",
+      });
+    }
 
-    // 3) Fechas del evento (una semana a partir de hoy)
-    const now = new Date();
-    const oneWeekMs = 7 * 24 * 60 * 60 * 1000;
-    const end = new Date(now.getTime() + oneWeekMs);
+    const rankingText = topMovies
+      .map((m, idx) => {
+        const pos = idx + 1;
+        const rating = m.avgRatingGlobal.toFixed(1);
+        const year = m.year ?? "?";
+        return `${pos}. ${m.title} (${year}) → nota media grupo ${rating}/10 (${m.numRatings} votos)`;
+      })
+      .join("\n");
+
+    const seenTitlesLower = new Set(
+      topMovies.map((m) => m.title.toLowerCase().trim())
+    );
+
+    // 2) Prompt para Gemini (tema + artículo + 3 pelis NO incluidas en ranking)
+    const systemPrompt = `
+Eres programador y articulista de un cineclub muy especial.
+
+Tienes delante la lista de 80 películas mejor valoradas por la comunidad.
+Eso te dice mucho sobre SUS GUSTOS REALES como grupo.
+
+TU MISIÓN:
+
+1) Analizar qué tipo de cine le gusta a esta comunidad en conjunto:
+   - ¿Valoran más el guion, la emoción, el ritmo, los finales duros, el humor…?
+   - ¿Hay tendencias claras? (cine de autor, hollywood clásico, thrillers, etc.)
+
+2) A partir de eso, definir una TEMÁTICA ORIGINAL para la "Semana de Cineclub":
+   - Ejemplos (NO los uses tal cual, crea otros): 
+     "Semana de heridas invisibles", 
+     "Semana de amores raros pero honestos",
+     "Semana de mundos que se derrumban",
+     "Semana de comedias que te curan un poco por dentro", etc.
+
+3) Escribir DOS textos sobre esa temática:
+   - shortDescription: 3–5 frases máximo, tono cercano, que sirva como introducción corta.
+   - longArticle: un ARTÍCULO extenso tipo revista de cine, en español:
+     • habla de cómo ha tratado el cine ese tema a lo largo del tiempo,
+     • menciona ejemplos de películas famosas (aunque no sean las del ranking),
+     • cuenta curiosidades, anécdotas, pequeños datos históricos,
+     • conecta el tema con la vida real del espectador,
+     • debe ser inspirador y muy agradable de leer.
+     • extensión orientativa: entre 800 y 1500 palabras.
+
+4) Proponer 3 PELÍCULAS CANDIDATAS para la semana que:
+   - NO aparezcan en la lista de 80 pelis del ranking que te paso.
+   - Encajen MUY bien con la temática.
+   - No sean las típicas ultra-mainstream del TOP histórico (busca cosas con alma, aunque sean conocidas).
+   - Para cada una:
+     • "title": título de la película,
+     • "year": año aproximado,
+     • "reason": 3–6 frases explicando por qué encaja tan bien en el tema y por qué podría gustar a ESTA comunidad.
+
+5) Crear también un "imagePrompt":
+   - descripción en inglés para ilustrar el tema de la semana en una sola imagen cinematográfica
+     (sin texto escrito dentro de la imagen).
+   - Piensa en algo que pueda usarse en un póster: composición, luz, atmósfera, etc.
+
+FORMATO DE RESPUESTA (OBLIGATORIO):
+
+{
+  "theme": "Nombre corto del evento",
+  "shortDescription": "Texto breve...",
+  "longArticle": "Artículo largo en español...",
+  "imagePrompt": "Prompt en inglés para generar una imagen IA...",
+  "candidates": [
+    { "title": "Nombre peli 1", "year": 2012, "reason": "Texto en español..." },
+    { "title": "Nombre peli 2", "year": 1998, "reason": "Texto en español..." },
+    { "title": "Nombre peli 3", "year": 2005, "reason": "Texto en español..." }
+  ]
+}
+
+No devuelvas nada fuera de este JSON.
+`;
+
+    const userPrompt = `
+Estas son las 80 películas más valoradas por la comunidad (ya las han visto y NO deben ser candidatas):
+
+${rankingText}
+
+Recuerda:
+- Usa estos datos como "huella de gustos" de la comunidad.
+- No repitas ninguna de estas películas como candidata de la semana.
+`;
+
+    const promptText = systemPrompt + "\n\n" + userPrompt;
+
+    const geminiResponse = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.0-flash:generateContent?key=${GEMINI_API_KEY}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [{ role: "user", parts: [{ text: promptText }] }],
+        }),
+      }
+    );
+
+    if (!geminiResponse.ok) {
+      const textErr = await geminiResponse.text();
+      console.error("Gemini error:", geminiResponse.status, textErr);
+      return res.status(500).json({
+        error: "Error llamando a Gemini para generar el evento.",
+        info: textErr,
+      });
+    }
+
+    const geminiJson: any = await geminiResponse.json();
+    const parts = geminiJson.candidates?.[0]?.content?.parts ?? [];
+    const textPart: string = parts.map((p: any) => p.text || "").join("\n");
+
+    let parsed: {
+      theme?: string;
+      shortDescription?: string;
+      longArticle?: string;
+      imagePrompt?: string;
+      candidates?: { title: string; year?: number | string; reason?: string }[];
+    } = {};
+
+    try {
+      parsed = JSON.parse(textPart);
+    } catch (e) {
+      console.error("Error parseando JSON de Gemini:", e, textPart);
+      const match = textPart.match(/\{[\s\S]*\}/);
+      if (match) {
+        try {
+          parsed = JSON.parse(match[0]);
+        } catch (e2) {
+          console.error("Parseo 2 fallido:", e2);
+        }
+      }
+    }
+
+    const theme = (parsed.theme || "").toString().trim();
+    const shortDescription = (parsed.shortDescription || "").toString().trim();
+    const longArticle = (parsed.longArticle || "").toString().trim();
+    const imagePrompt = (parsed.imagePrompt || "").toString().trim();
+    const rawCandidates = Array.isArray(parsed.candidates)
+      ? parsed.candidates
+      : [];
+
+    // Filtrar candidatos: título + reason y no repetir títulos del ranking
+    const cleanCandidates = rawCandidates.filter((c) => {
+      if (!c || !c.title || !c.reason) return false;
+      const titleLower = c.title.toString().toLowerCase().trim();
+      if (!titleLower) return false;
+      if (seenTitlesLower.has(titleLower)) return false;
+      return true;
+    });
+
+    if (!theme || !shortDescription || !longArticle || !cleanCandidates.length) {
+      console.error("Gemini devolvió datos incompletos:", parsed);
+      return res.status(500).json({
+        error: "Gemini devolvió un evento incompleto.",
+      });
+    }
+
+    // En este punto asumimos que ya tienes los tmdbId de esas pelis
+    // (por simplicidad, aquí NO busco en TMDB; podrías añadir búsqueda si quieres).
+    // Vamos a quedarnos con las 3 primeras y PONER tmdbId = 0 para que la app
+    // no rompa; más adelante amplías esto con búsqueda en TMDB si quieres.
+    const candidates = cleanCandidates.slice(0, 3).map((c) => {
+      const yearNum =
+        typeof c.year === "number"
+          ? c.year
+          : typeof c.year === "string"
+          ? parseInt(c.year, 10)
+          : undefined;
+
+      return {
+        tmdbId: 0, // TODO: aquí podrías buscar en TMDB por título+año para rellenar
+        title: c.title.toString(),
+        year: yearNum,
+      };
+    });
+
+    // Fechas de fases
+    const today = new Date();
+    const startVote = today;
+    const endVote = new Date(today.getTime());
+    endVote.setDate(endVote.getDate() + 6); // 7 días de votación
+
+    const startWatch = new Date(endVote.getTime());
+    startWatch.setDate(startWatch.getDate() + 1);
+    const endWatch = new Date(startWatch.getTime());
+    endWatch.setDate(endWatch.getDate() + 7);
+
+    const startForum = new Date(endWatch.getTime());
+    startForum.setDate(startForum.getDate() + 1);
+    const endForum = new Date(startForum.getTime());
+    endForum.setDate(endForum.getDate() + 7);
+
+    function toIsoDate(d: Date): string {
+      return d.toISOString().slice(0, 10);
+    }
+
+    const startVoteDate = toIsoDate(startVote);
+    const endVoteDate = toIsoDate(endVote);
+    const startWatchDate = toIsoDate(startWatch);
+    const endWatchDate = toIsoDate(endWatch);
+    const startForumDate = toIsoDate(startForum);
+    const endForumDate = toIsoDate(endForum);
+
+    const eventId = startVoteDate;
 
     const event: WeeklyEventDto = {
-      id: `week-${now.getFullYear()}-${now.getMonth() + 1}-${now.getDate()}`,
+      id: eventId,
       theme,
-      description,
-      startVoteDate: now.toISOString(),
-      endVoteDate: end.toISOString(),
-      candidates: candidates.map((c) => ({
-        tmdbId: c.tmdbId,
-        title: c.title,
-        year: c.year,
-      })),
+      shortDescription,
+      longArticle,
+      imagePrompt,
+      imageUrl: null,
+      startVoteDate,
+      endVoteDate,
+      startWatchDate,
+      endWatchDate,
+      startForumDate,
+      endForumDate,
+      phase: "VOTING",
+      candidates,
     };
 
-    return res.status(200).json({ event });
+    // Guardar en Firestore
+    await db.collection("weeklyEvents").doc(eventId).set({
+      ...event,
+      createdAt: admin.firestore.FieldValue.serverTimestamp(),
+    });
+
+    return res.status(200).json(event);
   } catch (e: any) {
-    console.error("Error general en /api/weekly-event-generate:", e);
+    console.error("Error general en weekly-event-generate:", e);
     return res.status(500).json({
-      error: "Error interno en el servidor.",
+      error: "Error interno generando el evento.",
       info: e?.message ?? "unknown",
     });
   }
