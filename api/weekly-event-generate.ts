@@ -1,3 +1,6 @@
+export default async function handler(req: any, res: any) {
+
+
 // pages/api/weekly-event-generate.ts
 import type { NextApiRequest, NextApiResponse } from "next";
 import { db } from "../../lib/firebaseAdmin";
@@ -291,4 +294,6 @@ Recuerda:
       info: e?.message ?? "unknown",
     });
   }
+}
+  
 }
