@@ -1,11 +1,16 @@
 {
-  "name": "cine-recommender",
+  "name": "cine-backend",
   "version": "1.0.0",
   "private": true,
   "scripts": {
-    "start": "node server.js"
+    "build": "tsc"
+  },
+  "dependencies": {
+    "firebase-admin": "latest"
   },
   "devDependencies": {
-    "@types/node": "^24.10.1"
+    "typescript": "latest",
+    "@types/node": "latest"
   }
 }
+
