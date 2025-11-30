@@ -1,5 +1,5 @@
 // pages/api/weekly-event-get.ts
-import type { NextApiRequest, NextApiResponse } from "next";
+
 import { db, admin } from "../lib/firebaseAdmin";
 import { WeeklyEventDto } from "./weekly-event-generate";
 
