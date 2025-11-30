@@ -1,9 +1,7 @@
-export default async function handler(req: any, res: any) {
+// api/weekly-event-generate.ts
 
-
-// pages/api/weekly-event-generate.ts
-import type { NextApiRequest, NextApiResponse } from "next";
-import { db } from "../lib/firebaseAdmin";
+// 👇 IMPORTS SIEMPRE ARRIBA
+import { db, admin } from "../lib/firebaseAdmin";
 import { fetchTopFromAppRanking, AppTopMovie } from "../helpers/fetchTopFromAppRanking";
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
@@ -33,13 +31,10 @@ export type WeeklyEventDto = {
 
 type ApiResponse = { error?: string; info?: string } | WeeklyEventDto;
 
-export default async function handler(
-  req: NextApiRequest,
-  res: NextApiResponse<ApiResponse>
-) {
+// 👇 SOLO UN handler y SIN tipos de "next"
+export default async function handler(req: any, res: any) {
   try {
-    // ⚠️ Este endpoint lo llamará SOLO el CRON de Vercel,
-    // puedes protegerlo con un token en cabecera si quieres.
+    // Solo queremos que el cron llame con POST (o cámbialo a GET si lo prefieres)
     if (req.method !== "POST") {
       return res.status(405).json({ error: "Método no permitido" });
     }
@@ -72,7 +67,7 @@ export default async function handler(
       topMovies.map((m) => m.title.toLowerCase().trim())
     );
 
-    // 2) Prompt para Gemini (tema + artículo + 3 pelis NO incluidas en ranking)
+    // 2) Prompt para Gemini
     const systemPrompt = `
 Eres programador y articulista de un cineclub muy especial.
 
@@ -199,7 +194,6 @@ Recuerda:
       ? parsed.candidates
       : [];
 
-    // Filtrar candidatos: título + reason y no repetir títulos del ranking
     const cleanCandidates = rawCandidates.filter((c) => {
       if (!c || !c.title || !c.reason) return false;
       const titleLower = c.title.toString().toLowerCase().trim();
@@ -215,10 +209,6 @@ Recuerda:
       });
     }
 
-    // En este punto asumimos que ya tienes los tmdbId de esas pelis
-    // (por simplicidad, aquí NO busco en TMDB; podrías añadir búsqueda si quieres).
-    // Vamos a quedarnos con las 3 primeras y PONER tmdbId = 0 para que la app
-    // no rompa; más adelante amplías esto con búsqueda en TMDB si quieres.
     const candidates = cleanCandidates.slice(0, 3).map((c) => {
       const yearNum =
         typeof c.year === "number"
@@ -228,7 +218,7 @@ Recuerda:
           : undefined;
 
       return {
-        tmdbId: 0, // TODO: aquí podrías buscar en TMDB por título+año para rellenar
+        tmdbId: 0, // TODO: buscar en TMDB si quieres el ID real
         title: c.title.toString(),
         year: yearNum,
       };
@@ -238,7 +228,7 @@ Recuerda:
     const today = new Date();
     const startVote = today;
     const endVote = new Date(today.getTime());
-    endVote.setDate(endVote.getDate() + 6); // 7 días de votación
+    endVote.setDate(endVote.getDate() + 6);
 
     const startWatch = new Date(endVote.getTime());
     startWatch.setDate(startWatch.getDate() + 1);
@@ -250,9 +240,7 @@ Recuerda:
     const endForum = new Date(startForum.getTime());
     endForum.setDate(endForum.getDate() + 7);
 
-    function toIsoDate(d: Date): string {
-      return d.toISOString().slice(0, 10);
-    }
+    const toIsoDate = (d: Date): string => d.toISOString().slice(0, 10);
 
     const startVoteDate = toIsoDate(startVote);
     const endVoteDate = toIsoDate(endVote);
@@ -280,7 +268,6 @@ Recuerda:
       candidates,
     };
 
-    // Guardar en Firestore
     await db.collection("weeklyEvents").doc(eventId).set({
       ...event,
       createdAt: admin.firestore.FieldValue.serverTimestamp(),
@@ -295,5 +282,4 @@ Recuerda:
     });
   }
 }
-  
-}
+
