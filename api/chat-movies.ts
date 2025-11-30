@@ -1,5 +1,4 @@
-// pages/api/chat-movies.ts
-
+// api/chat-movies.ts
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const TMDB_API_KEY = process.env.TMDB_API_KEY;
@@ -77,9 +76,10 @@ async function searchMovieOnTmdb(
 
 // --------- Handler principal ---------
 
+// 👇 IMPORTANTE: sin tipos de Next, usamos `any` para Vercel serverless
 export default async function handler(
-  req: NextApiRequest,
-  res: NextApiResponse<ApiResponse>
+  req: any,
+  res: any
 ) {
   try {
     if (req.method !== "POST") {
