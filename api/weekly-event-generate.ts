@@ -1,5 +1,5 @@
 // api/weekly-event-generate.ts
-import type { NextApiRequest, NextApiResponse } from "next";
+
 // 👇 IMPORTS SIEMPRE ARRIBA
 import { db, admin } from "../lib/firebaseAdmin";
 import { fetchTopFromAppRanking, AppTopMovie } from "../helpers/fetchTopFromAppRanking";
@@ -121,7 +121,7 @@ FORMATO DE RESPUESTA (OBLIGATORIO):
   "candidates": [
     { "title": "Nombre peli 1", "year": 2012, "reason": "Texto en español..." },
     { "title": "Nombre peli 2", "year": 1998, "reason": "Texto en español..." },
-    { "title": "Nombre peli 3", "year": 2005, "reason": "Texto en español..." }
+    { "title": "Nombre peli 3", "year": 2005", "reason": "Texto en español..." }
   ]
 }
 
