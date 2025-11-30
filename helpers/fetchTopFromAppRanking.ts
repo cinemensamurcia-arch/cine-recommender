@@ -1,5 +1,5 @@
 // helpers/fetchTopFromAppRanking.ts
-import { db } from "../lib/firestoreAdmin";
+import { db } from "../lib/firesbaseAdmin";
 
 export type AppTopMovie = {
   tmdbId: number;
