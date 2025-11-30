@@ -1,5 +1,5 @@
 // api/weekly-event-generate.ts
-
+import type { NextApiRequest, NextApiResponse } from "next";
 // 👇 IMPORTS SIEMPRE ARRIBA
 import { db, admin } from "../lib/firebaseAdmin";
 import { fetchTopFromAppRanking, AppTopMovie } from "../helpers/fetchTopFromAppRanking";
