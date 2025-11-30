@@ -4,5 +4,8 @@
   "private": true,
   "scripts": {
     "start": "node server.js"
+  },
+  "devDependencies": {
+    "@types/node": "^24.10.1"
   }
 }
