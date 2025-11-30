@@ -1,5 +1,4 @@
-// pages/api/recommendations.ts
-
+// api/recommendations.ts
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const TMDB_API_KEY = process.env.TMDB_API_KEY; // o pon tu key fija si quieres
@@ -201,9 +200,10 @@ async function fallbackSimpleFromTmdb(
 
 // --------- Handler principal ---------
 
+// 👇 aquí quitamos Next y usamos `any` en req/res para Vercel serverless
 export default async function handler(
-  req: NextApiRequest,
-  res: NextApiResponse<ApiResponse>
+  req: any,
+  res: any
 ) {
   try {
     if (req.method !== "POST") {
