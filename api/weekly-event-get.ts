@@ -1,6 +1,6 @@
 // pages/api/weekly-event-get.ts
 import type { NextApiRequest, NextApiResponse } from "next";
-import { db } from "../../lib/firestoreAdmin";
+import { db, admin } from "../lib/firebaseAdmin";
 import { WeeklyEventDto } from "./weekly-event-generate";
 
 type ApiResponse = { error: string; info?: string } | WeeklyEventDto;
