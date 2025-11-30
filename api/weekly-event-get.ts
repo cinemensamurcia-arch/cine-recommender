@@ -1,14 +1,12 @@
-// pages/api/weekly-event-get.ts
+// api/weekly-event-get.ts
 
-import { db, admin } from "../lib/firebaseAdmin";
+import { db } from "../lib/firebaseAdmin";
 import { WeeklyEventDto } from "./weekly-event-generate";
 
 type ApiResponse = { error: string; info?: string } | WeeklyEventDto;
 
-export default async function handler(
-  req: NextApiRequest,
-  res: NextApiResponse<ApiResponse>
-) {
+// 👇 handler sin tipos de Next
+export default async function handler(req: any, res: any) {
   try {
     if (req.method !== "GET") {
       res.setHeader("Allow", "GET");
@@ -22,11 +20,14 @@ export default async function handler(
       .get();
 
     if (snap.empty) {
-      return res.status(404).json({ error: "No hay evento semanal disponible." });
+      return res
+        .status(404)
+        .json({ error: "No hay evento semanal disponible.", info: "empty" });
     }
 
     const doc = snap.docs[0];
     const data = doc.data() as WeeklyEventDto;
+
     return res.status(200).json(data);
   } catch (e: any) {
     console.error("Error en weekly-event-get:", e);
@@ -36,3 +37,4 @@ export default async function handler(
     });
   }
 }
+
