@@ -1,5 +1,5 @@
 // pages/api/recommendations.ts
-import type { NextApiRequest, NextApiResponse } from "next";
+
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
 const TMDB_API_KEY = process.env.TMDB_API_KEY; // o pon tu key fija si quieres
