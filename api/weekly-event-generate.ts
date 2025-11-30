@@ -1,6 +1,6 @@
 // pages/api/weekly-event-generate.ts
 import type { NextApiRequest, NextApiResponse } from "next";
-import { db } from "../../lib/firestoreAdmin";
+import { db } from "../../lib/firebaseAdmin";
 import { fetchTopFromAppRanking, AppTopMovie } from "../../helpers/fetchTopFromAppRanking";
 
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
